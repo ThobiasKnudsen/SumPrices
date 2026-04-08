@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/receipt_provider.dart';
 import '../models/receipt.dart';
+import 'analytics_screen.dart';
 import 'capture_screen.dart';
 import 'items_screen.dart';
 import 'receipt_detail_screen.dart';
@@ -165,6 +166,6 @@ class _AnalyticsTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Center(child: Text('Analytics - coming soon'));
+    return const AnalyticsScreen();
   }
 }

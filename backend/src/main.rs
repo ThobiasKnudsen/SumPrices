@@ -1,3 +1,4 @@
+mod analytics;
 mod auth;
 mod config;
 mod db;
@@ -83,6 +84,9 @@ async fn main() {
             "/api/receipts/{id}/status",
             get(receipts::handlers::ocr_status),
         )
+        // Analytics
+        .route("/api/analytics/spending", get(analytics::handlers::spending))
+        .route("/api/analytics/by-store", get(analytics::handlers::by_store))
         // Items
         .route("/api/items", get(items::handlers::list))
         .route("/api/items/{id}", put(items::handlers::update))
