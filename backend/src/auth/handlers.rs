@@ -88,6 +88,7 @@ pub async fn register(
                 id: row.0,
                 email: row.1,
                 display_name: row.2,
+                credit_balance: 0,
             },
         }),
     ))
@@ -97,8 +98,8 @@ pub async fn login(
     State(pool): State<PgPool>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>)>(
-        "SELECT id, email, password_hash, display_name FROM users WHERE email = $1",
+    let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, i32)>(
+        "SELECT id, email, password_hash, display_name, credit_balance FROM users WHERE email = $1",
     )
     .bind(&req.email)
     .fetch_optional(&pool)
@@ -115,6 +116,7 @@ pub async fn login(
             id: row.0,
             email: row.1,
             display_name: row.3,
+            credit_balance: row.4,
         },
     }))
 }
@@ -123,8 +125,8 @@ pub async fn me(
     auth: AuthUser,
     State(pool): State<PgPool>,
 ) -> Result<Json<UserResponse>, AppError> {
-    let row = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>)>(
-        "SELECT id, email, display_name FROM users WHERE id = $1",
+    let row = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, i32)>(
+        "SELECT id, email, display_name, credit_balance FROM users WHERE id = $1",
     )
     .bind(auth.user_id)
     .fetch_optional(&pool)
@@ -135,5 +137,6 @@ pub async fn me(
         id: row.0,
         email: row.1,
         display_name: row.2,
+        credit_balance: row.3,
     }))
 }

@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -40,9 +40,13 @@ class ReceiptProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<Receipt?> uploadReceipt(File imageFile) async {
+  Future<Receipt?> uploadReceipt({
+    required Uint8List bytes,
+    required String filename,
+  }) async {
     try {
-      final receipt = await _receiptService.upload(imageFile);
+      final receipt =
+          await _receiptService.upload(bytes: bytes, filename: filename);
       _receipts.insert(0, receipt);
       _totalCount++;
       notifyListeners();
@@ -64,9 +68,9 @@ class ReceiptProvider extends ChangeNotifier {
     }
   }
 
-  Future<OcrStatus?> checkOcrStatus(String id) async {
+  Future<ExtractionStatus?> checkExtractionStatus(String id) async {
     try {
-      return await _receiptService.checkOcrStatus(id);
+      return await _receiptService.checkExtractionStatus(id);
     } catch (_) {
       return null;
     }

@@ -65,7 +65,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: _openCapture,
-        child: const Icon(Icons.camera_alt),
+        child: const Icon(Icons.upload_file),
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
@@ -129,14 +129,19 @@ class _ReceiptCard extends StatelessWidget {
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       child: ListTile(
         leading: Icon(
-          receipt.ocrStatus == 'done' ? Icons.receipt : Icons.hourglass_top,
-          color: receipt.ocrStatus == 'done' ? Colors.green : Colors.orange,
+          receipt.extractionStatus == 'done'
+              ? Icons.receipt
+              : Icons.hourglass_top,
+          color: receipt.extractionStatus == 'done'
+              ? Colors.green
+              : Colors.orange,
         ),
-        title: Text(receipt.storeName ?? 'Unknown store'),
-        subtitle: Text(receipt.purchaseDate ?? receipt.createdAt.substring(0, 10)),
+        title: Text(receipt.storeNameRaw ?? 'Unknown store'),
+        subtitle:
+            Text(receipt.purchaseAt ?? receipt.createdAt.substring(0, 10)),
         trailing: receipt.total != null
             ? Text(
-                '${receipt.total!.toStringAsFixed(2)} ${receipt.currency ?? "NOK"}',
+                '${receipt.total!.toStringAsFixed(2)} ${receipt.currency}',
                 style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
               )
             : const Text('--'),

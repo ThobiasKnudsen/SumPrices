@@ -69,11 +69,12 @@ class _ReceiptDetailScreenState extends State<ReceiptDetailScreen> {
     }
 
     final receipt = _detail!.receipt;
-    final items = _detail!.items;
+    final transactions = _detail!.transactions;
+    final imageUrl = _detail!.imageUrl;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(receipt.storeName ?? 'Receipt'),
+        title: Text(receipt.storeNameRaw ?? 'Receipt'),
         actions: [
           IconButton(icon: const Icon(Icons.delete), onPressed: _deleteReceipt),
         ],
@@ -83,6 +84,29 @@ class _ReceiptDetailScreenState extends State<ReceiptDetailScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            // Receipt image preview (presigned URL, web-safe)
+            if (imageUrl != null && imageUrl.isNotEmpty) ...[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  imageUrl,
+                  fit: BoxFit.contain,
+                  loadingBuilder: (context, child, progress) {
+                    if (progress == null) return child;
+                    return const SizedBox(
+                      height: 200,
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  },
+                  errorBuilder: (context, error, stackTrace) => const SizedBox(
+                    height: 120,
+                    child: Center(child: Text('Could not load image')),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+
             // Receipt header card
             Card(
               child: Padding(
@@ -90,28 +114,31 @@ class _ReceiptDetailScreenState extends State<ReceiptDetailScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _InfoRow('Store', receipt.storeName ?? 'Unknown'),
-                    _InfoRow('Date', receipt.purchaseDate ?? 'Unknown'),
+                    _InfoRow('Store', receipt.storeNameRaw ?? 'Unknown'),
+                    _InfoRow('Date', receipt.purchaseAt ?? 'Unknown'),
                     _InfoRow(
                       'Total',
                       receipt.total != null
-                          ? '${receipt.total!.toStringAsFixed(2)} ${receipt.currency ?? "NOK"}'
+                          ? '${receipt.total!.toStringAsFixed(2)} ${receipt.currency}'
                           : '--',
                     ),
-                    _InfoRow('OCR Status', receipt.ocrStatus),
-                    if (receipt.ocrConfidence != null)
-                      _InfoRow('Confidence', '${(receipt.ocrConfidence! * 100).toStringAsFixed(0)}%'),
+                    _InfoRow('Status', receipt.extractionStatus),
+                    if (receipt.extractionConf != null)
+                      _InfoRow('Confidence',
+                          '${(receipt.extractionConf! * 100).toStringAsFixed(0)}%'),
+                    if (receipt.needsReview)
+                      _InfoRow('Review', 'Needs review'),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 16),
 
-            // Items
-            Text('Items (${items.length})',
+            // Transactions
+            Text('Items (${transactions.length})',
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            if (items.isEmpty)
+            if (transactions.isEmpty)
               const Card(
                 child: Padding(
                   padding: EdgeInsets.all(32),
@@ -119,15 +146,13 @@ class _ReceiptDetailScreenState extends State<ReceiptDetailScreen> {
                 ),
               )
             else
-              ...items.map((item) => Card(
+              ...transactions.map((t) => Card(
                     child: ListTile(
-                      title: Text(item.description),
-                      subtitle: item.quantity != null
-                          ? Text('Qty: ${item.quantity!.toStringAsFixed(item.quantity == item.quantity!.roundToDouble() ? 0 : 1)}')
-                          : null,
+                      title: Text(t.displayDescription),
+                      subtitle: Text(_transactionSubtitle(t)),
                       trailing: Text(
-                        item.lineTotal != null
-                            ? item.lineTotal!.toStringAsFixed(2)
+                        t.lineTotal != null
+                            ? t.lineTotal!.toStringAsFixed(2)
                             : '--',
                         style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
@@ -137,6 +162,24 @@ class _ReceiptDetailScreenState extends State<ReceiptDetailScreen> {
         ),
       ),
     );
+  }
+
+  String _transactionSubtitle(Transaction t) {
+    final parts = <String>[];
+    if (t.quantity != null) {
+      final qty = t.quantity!;
+      final qtyStr = qty == qty.roundToDouble()
+          ? qty.toStringAsFixed(0)
+          : qty.toStringAsFixed(1);
+      parts.add('Qty: $qtyStr${t.unit != null ? " ${t.unit}" : ""}');
+    }
+    if (t.unitPrice != null) {
+      parts.add('@ ${t.unitPrice!.toStringAsFixed(2)}');
+    }
+    if (t.itemType != 'product' && t.itemType.isNotEmpty) {
+      parts.add(t.itemType);
+    }
+    return parts.join('  ·  ');
   }
 }
 

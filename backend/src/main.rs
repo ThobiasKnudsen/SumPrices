@@ -1,47 +1,13 @@
-mod analytics;
-mod auth;
-mod config;
-mod db;
-mod errors;
-mod items;
-mod receipts;
-mod storage;
-
-use std::sync::Arc;
-
 use axum::Router;
 use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::receipts::ocr::TabscannerClient;
-use crate::storage::s3::Storage;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub pool: sqlx::PgPool,
-    pub storage: Storage,
-    pub ocr_client: Arc<TabscannerClient>,
-}
-
-impl axum::extract::FromRef<AppState> for sqlx::PgPool {
-    fn from_ref(state: &AppState) -> Self {
-        state.pool.clone()
-    }
-}
-
-impl axum::extract::FromRef<AppState> for Storage {
-    fn from_ref(state: &AppState) -> Self {
-        state.storage.clone()
-    }
-}
-
-impl axum::extract::FromRef<AppState> for Arc<TabscannerClient> {
-    fn from_ref(state: &AppState) -> Self {
-        state.ocr_client.clone()
-    }
-}
+use kvitteringsapp_backend::storage::s3::Storage;
+use kvitteringsapp_backend::{
+    analytics, auth, config, db, extraction, receipts, transactions, AppState,
+};
 
 #[tokio::main]
 async fn main() {
@@ -59,13 +25,16 @@ async fn main() {
         .await
         .expect("Failed to run migrations");
 
+    if let Err(e) = Storage::ensure_bucket(&config).await {
+        tracing::warn!("bucket ensure failed: {e}");
+    }
     let storage = Storage::new(&config);
-    let ocr_client = Arc::new(TabscannerClient::new(&config.tabscanner_api_key));
+    let extractor = extraction::build_from_env(&config);
 
     let state = AppState {
         pool,
         storage,
-        ocr_client,
+        extractor,
     };
 
     let app = Router::new()
@@ -80,26 +49,24 @@ async fn main() {
         .route("/api/receipts/{id}", get(receipts::handlers::get_one))
         .route("/api/receipts/{id}", put(receipts::handlers::update))
         .route("/api/receipts/{id}", delete(receipts::handlers::delete))
-        .route(
-            "/api/receipts/{id}/status",
-            get(receipts::handlers::ocr_status),
-        )
+        .route("/api/receipts/{id}/status", get(receipts::handlers::status))
+        // Transactions
+        .route("/api/transactions", get(transactions::handlers::list))
+        .route("/api/transactions/{id}", put(transactions::handlers::update))
+        .route("/api/transactions/{id}", delete(transactions::handlers::delete))
         // Analytics
         .route("/api/analytics/spending", get(analytics::handlers::spending))
         .route("/api/analytics/by-store", get(analytics::handlers::by_store))
-        // Items
-        .route("/api/items", get(items::handlers::list))
-        .route("/api/items/{id}", put(items::handlers::update))
-        .route("/api/items/{id}", delete(items::handlers::delete))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .expect("Failed to bind to port 3000");
+        .unwrap_or_else(|e| panic!("Failed to bind to {bind_addr}: {e}"));
 
-    tracing::info!("Server running on http://0.0.0.0:3000");
+    tracing::info!("Server running on http://{bind_addr}");
     axum::serve(listener, app).await.expect("Server error");
 }
 

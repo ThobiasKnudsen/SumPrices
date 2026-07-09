@@ -20,8 +20,8 @@ dependencies:
   # Auth & secure storage
   flutter_secure_storage: ^9.0.0
 
-  # Camera & image picking
-  image_picker: ^1.0.0
+  # File picking (image or PDF, web-safe bytes)
+  file_picker: ^11.0.2
 
   # Navigation
   go_router: ^14.0.0

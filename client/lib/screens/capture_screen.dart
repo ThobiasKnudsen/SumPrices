@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../providers/receipt_provider.dart';
@@ -15,26 +15,49 @@ class CaptureScreen extends StatefulWidget {
 }
 
 class _CaptureScreenState extends State<CaptureScreen> {
-  File? _imageFile;
+  Uint8List? _bytes;
+  String? _filename;
   bool _isUploading = false;
   bool _isPolling = false;
-  String? _ocrStatus;
-  final ImagePicker _picker = ImagePicker();
+  String? _extractionStatus;
 
-  Future<void> _pickImage(ImageSource source) async {
-    final picked = await _picker.pickImage(source: source, imageQuality: 85);
-    if (picked != null) {
-      setState(() => _imageFile = File(picked.path));
+  bool get _isPdf => _filename?.toLowerCase().endsWith('.pdf') ?? false;
+
+  Future<void> _pickFile() async {
+    final result = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['jpg', 'jpeg', 'png', 'webp', 'pdf'],
+      withData: true, // required on web to get bytes back
+    );
+
+    if (result == null || result.files.isEmpty) return;
+
+    final file = result.files.first;
+    if (file.bytes == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not read the selected file')),
+        );
+      }
+      return;
     }
+
+    setState(() {
+      _bytes = file.bytes;
+      _filename = file.name;
+    });
   }
 
   Future<void> _upload() async {
-    if (_imageFile == null) return;
+    final bytes = _bytes;
+    final filename = _filename;
+    if (bytes == null || filename == null) return;
 
     setState(() => _isUploading = true);
 
     final provider = context.read<ReceiptProvider>();
-    final receipt = await provider.uploadReceipt(_imageFile!);
+    final receipt =
+        await provider.uploadReceipt(bytes: bytes, filename: filename);
 
     if (receipt == null) {
       setState(() => _isUploading = false);
@@ -46,31 +69,39 @@ class _CaptureScreenState extends State<CaptureScreen> {
       return;
     }
 
-    // Start polling for OCR completion
+    // Start polling for extraction completion.
     setState(() {
       _isUploading = false;
       _isPolling = true;
-      _ocrStatus = receipt.ocrStatus;
+      _extractionStatus = receipt.extractionStatus;
     });
 
-    await _pollOcrStatus(receipt.id);
+    await _pollExtractionStatus(receipt.id);
   }
 
-  Future<void> _pollOcrStatus(String receiptId) async {
+  Future<void> _pollExtractionStatus(String receiptId) async {
     final provider = context.read<ReceiptProvider>();
 
     while (mounted && _isPolling) {
       await Future.delayed(const Duration(seconds: 2));
 
-      final status = await provider.checkOcrStatus(receiptId);
+      final status = await provider.checkExtractionStatus(receiptId);
       if (status == null) continue;
 
-      setState(() => _ocrStatus = status.status);
+      setState(() => _extractionStatus = status.status);
 
-      if (status.status == 'done' || status.status == 'failed') {
+      const terminal = {'done', 'failed', 'needs_review'};
+      if (terminal.contains(status.status)) {
         setState(() => _isPolling = false);
-        if (mounted && status.status == 'done') {
-          Navigator.of(context).pop(receiptId);
+        if (mounted) {
+          if (status.status == 'failed') {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Extraction failed')),
+            );
+          } else {
+            // 'done' or 'needs_review' — both have a receipt worth viewing.
+            Navigator.of(context).pop(receiptId);
+          }
         }
         break;
       }
@@ -86,35 +117,13 @@ class _CaptureScreenState extends State<CaptureScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Scan Receipt')),
+      appBar: AppBar(title: const Text('Upload Receipt')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Expanded(
-              child: _imageFile != null
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Image.file(_imageFile!, fit: BoxFit.contain),
-                    )
-                  : Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey.shade300, width: 2),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Center(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.receipt_long, size: 64, color: Colors.grey),
-                            SizedBox(height: 16),
-                            Text('Take a photo or pick from gallery'),
-                          ],
-                        ),
-                      ),
-                    ),
-            ),
+            Expanded(child: _buildPreview()),
             const SizedBox(height: 16),
             if (_isUploading || _isPolling)
               Column(
@@ -123,34 +132,22 @@ class _CaptureScreenState extends State<CaptureScreen> {
                   const SizedBox(height: 8),
                   Text(
                     _isPolling
-                        ? 'Processing receipt (${_ocrStatus ?? "..."})'
+                        ? 'Processing receipt (${_extractionStatus ?? "..."})'
                         : 'Uploading...',
                     style: const TextStyle(fontSize: 16),
                   ),
                 ],
               )
             else ...[
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () => _pickImage(ImageSource.camera),
-                      icon: const Icon(Icons.camera_alt),
-                      label: const Text('Camera'),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () => _pickImage(ImageSource.gallery),
-                      icon: const Icon(Icons.photo_library),
-                      label: const Text('Gallery'),
-                    ),
-                  ),
-                ],
+              OutlinedButton.icon(
+                onPressed: _pickFile,
+                icon: const Icon(Icons.attach_file),
+                label: Text(_bytes == null
+                    ? 'Choose image or PDF'
+                    : 'Choose a different file'),
               ),
               const SizedBox(height: 12),
-              if (_imageFile != null)
+              if (_bytes != null)
                 FilledButton.icon(
                   onPressed: _upload,
                   icon: const Icon(Icons.cloud_upload),
@@ -160,6 +157,51 @@ class _CaptureScreenState extends State<CaptureScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildPreview() {
+    if (_bytes == null) {
+      return Container(
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.grey.shade300, width: 2),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.receipt_long, size: 64, color: Colors.grey),
+              SizedBox(height: 16),
+              Text('Select a receipt image or PDF'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_isPdf) {
+      return Container(
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.grey.shade300, width: 2),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.picture_as_pdf, size: 64, color: Colors.red),
+              const SizedBox(height: 16),
+              Text(_filename ?? 'PDF selected'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Image.memory(_bytes!, fit: BoxFit.contain),
     );
   }
 }

@@ -2,6 +2,10 @@
 backend/target/
 backend/.env
 
+# Dev ingest harness: sample receipts (keep the folder, ignore contents)
+backend/dev_receipts/*
+!backend/dev_receipts/.gitkeep
+
 # Flutter
 client/.dart_tool/
 client/.packages

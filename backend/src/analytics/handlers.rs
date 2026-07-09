@@ -50,16 +50,16 @@ pub async fn spending(
     };
 
     let periods = sqlx::query_as::<_, SpendingPeriod>(&format!(
-        "SELECT to_char(date_trunc('{trunc}', purchase_date), 'YYYY-MM-DD') as label,
+        "SELECT to_char(date_trunc('{trunc}', purchase_at), 'YYYY-MM-DD') as label,
                 SUM(total) as total
          FROM receipts
          WHERE user_id = $1
-           AND purchase_date IS NOT NULL
+           AND purchase_at IS NOT NULL
            AND total IS NOT NULL
-           AND ($2::date IS NULL OR purchase_date >= $2)
-           AND ($3::date IS NULL OR purchase_date <= $3)
-         GROUP BY date_trunc('{trunc}', purchase_date)
-         ORDER BY date_trunc('{trunc}', purchase_date)"
+           AND ($2::date IS NULL OR purchase_at::date >= $2)
+           AND ($3::date IS NULL OR purchase_at::date <= $3)
+         GROUP BY date_trunc('{trunc}', purchase_at)
+         ORDER BY date_trunc('{trunc}', purchase_at)"
     ))
     .bind(auth.user_id)
     .bind(params.from)
@@ -76,13 +76,13 @@ pub async fn by_store(
     Query(params): Query<SpendingQuery>,
 ) -> Result<Json<ByStoreResponse>, AppError> {
     let stores = sqlx::query_as::<_, StoreSpending>(
-        "SELECT store_name as name, SUM(total) as total, COUNT(*) as count
+        "SELECT store_name_raw as name, SUM(total) as total, COUNT(*) as count
          FROM receipts
          WHERE user_id = $1
            AND total IS NOT NULL
-           AND ($2::date IS NULL OR purchase_date >= $2)
-           AND ($3::date IS NULL OR purchase_date <= $3)
-         GROUP BY store_name
+           AND ($2::date IS NULL OR purchase_at::date >= $2)
+           AND ($3::date IS NULL OR purchase_at::date <= $3)
+         GROUP BY store_name_raw
          ORDER BY total DESC NULLS LAST",
     )
     .bind(auth.user_id)

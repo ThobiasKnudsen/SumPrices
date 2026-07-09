@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/api_client.dart';
-import '../services/item_service.dart';
+import '../services/transaction_service.dart';
 import 'receipt_detail_screen.dart';
 
 class ItemsScreen extends StatefulWidget {
@@ -15,9 +15,9 @@ class ItemsScreen extends StatefulWidget {
 }
 
 class _ItemsScreenState extends State<ItemsScreen> {
-  late final ItemService _itemService;
+  late final TransactionService _transactionService;
   final _searchController = TextEditingController();
-  List<ItemWithContext> _items = [];
+  List<TransactionWithContext> _items = [];
   int _totalCount = 0;
   bool _isLoading = false;
   Timer? _debounce;
@@ -25,7 +25,7 @@ class _ItemsScreenState extends State<ItemsScreen> {
   @override
   void initState() {
     super.initState();
-    _itemService = ItemService(context.read<ApiClient>());
+    _transactionService = TransactionService(context.read<ApiClient>());
     _loadItems();
   }
 
@@ -40,9 +40,9 @@ class _ItemsScreenState extends State<ItemsScreen> {
     setState(() => _isLoading = true);
 
     try {
-      final response = await _itemService.list(q: query);
+      final response = await _transactionService.list(q: query);
       setState(() {
-        _items = response.items;
+        _items = response.transactions;
         _totalCount = response.totalCount;
       });
     } catch (_) {
@@ -99,9 +99,9 @@ class _ItemsScreenState extends State<ItemsScreen> {
                             margin: const EdgeInsets.symmetric(
                                 horizontal: 16, vertical: 4),
                             child: ListTile(
-                              title: Text(item.description),
+                              title: Text(item.displayDescription),
                               subtitle: Text(
-                                '${item.storeName ?? "Unknown store"} - ${item.purchaseDate ?? ""}',
+                                '${item.storeNameRaw ?? "Unknown store"} - ${item.purchaseAt ?? ""}',
                               ),
                               trailing: Text(
                                 item.lineTotal != null

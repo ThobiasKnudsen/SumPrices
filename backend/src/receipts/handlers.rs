@@ -3,82 +3,102 @@ use std::sync::Arc;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthUser;
+use crate::enums::ReceiptSource;
 use crate::errors::AppError;
+use crate::extraction::ReceiptExtractor;
 use crate::storage::s3::Storage;
+use crate::GIT_COMMIT;
 
 use super::models::*;
-use super::ocr::{self, TabscannerClient};
+use super::pipeline;
+
+const RECEIPT_COLS: &str = "id, user_id, store_name_raw, purchase_at, subtotal, mva_total, total, \
+     currency, extraction_status, extraction_conf, needs_review, created_at, updated_at, original_asset_key";
+
+async fn fetch_receipt(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<Receipt, AppError> {
+    sqlx::query_as::<_, Receipt>(&format!(
+        "SELECT {RECEIPT_COLS} FROM receipts WHERE id = $1 AND user_id = $2"
+    ))
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AppError::NotFound)
+}
 
 pub async fn upload(
     auth: AuthUser,
     State(pool): State<PgPool>,
     State(storage): State<Storage>,
-    State(ocr_client): State<Arc<TabscannerClient>>,
+    State(extractor): State<Arc<dyn ReceiptExtractor>>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<Receipt>), AppError> {
-    let mut image_data: Option<Vec<u8>> = None;
-    let mut content_type = "image/jpeg".to_string();
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut content_type = "application/octet-stream".to_string();
+    let mut source = ReceiptSource::ImageUpload;
 
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| AppError::BadRequest(format!("Invalid multipart: {e}")))?
     {
-        if field.name() == Some("image") {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "image" || name == "pdf" {
             if let Some(ct) = field.content_type() {
                 content_type = ct.to_string();
             }
-            image_data = Some(
+            source = if name == "pdf" || content_type == "application/pdf" {
+                ReceiptSource::PdfUpload
+            } else {
+                ReceiptSource::ImageUpload
+            };
+            file_bytes = Some(
                 field
                     .bytes()
                     .await
-                    .map_err(|e| AppError::BadRequest(format!("Failed to read image: {e}")))?
+                    .map_err(|e| AppError::BadRequest(format!("Failed to read file: {e}")))?
                     .to_vec(),
             );
         }
     }
 
-    let image_data = image_data.ok_or_else(|| AppError::BadRequest("No image provided".into()))?;
-    let image_key = format!("{}/{}.jpg", auth.user_id, Uuid::new_v4());
+    let bytes =
+        file_bytes.ok_or_else(|| AppError::BadRequest("No file provided (field 'image' or 'pdf')".into()))?;
+    let file_hash = hex::encode(Sha256::digest(&bytes));
 
-    // Upload to S3
-    storage
-        .upload(&image_key, &image_data, &content_type)
-        .await?;
-
-    // Insert receipt row
-    let receipt = sqlx::query_as::<_, Receipt>(
-        "INSERT INTO receipts (user_id, image_key, ocr_status)
-         VALUES ($1, $2, 'pending')
-         RETURNING id, user_id, store_name, purchase_date, purchase_time,
-                   total, subtotal, currency, image_key, ocr_confidence,
-                   ocr_status, created_at, updated_at",
+    let receipt_id = pipeline::insert_pending_receipt(
+        &pool,
+        auth.user_id,
+        source,
+        Some(&content_type),
+        Some(&file_hash),
+        GIT_COMMIT,
     )
-    .bind(auth.user_id)
-    .bind(&image_key)
-    .fetch_one(&pool)
     .await?;
 
-    // Submit to Tabscanner in background (don't block the response)
-    let pool_clone = pool.clone();
-    let receipt_id = receipt.id;
-    let ocr = ocr_client.clone();
-    let ct = content_type.clone();
+    let ext = if source == ReceiptSource::PdfUpload {
+        "pdf"
+    } else {
+        "jpg"
+    };
+    let key = format!("{}/{}.{}", auth.user_id, receipt_id, ext);
+    storage.upload(&key, &bytes, &content_type).await?;
+    pipeline::set_asset_key(&pool, receipt_id, &key).await?;
+
+    // Extract off the request path.
+    let pool2 = pool.clone();
+    let user_id = auth.user_id;
+    let mime2 = content_type.clone();
     tokio::spawn(async move {
-        if let Err(e) = ocr::submit_for_ocr(&pool_clone, receipt_id, &image_data, &ct, &ocr).await
-        {
-            tracing::error!("OCR submission failed for receipt {receipt_id}: {e}");
-            let _ = sqlx::query("UPDATE receipts SET ocr_status = 'failed' WHERE id = $1")
-                .bind(receipt_id)
-                .execute(&pool_clone)
-                .await;
-        }
+        pipeline::run_extraction(&pool2, &extractor, receipt_id, user_id, &bytes, &mime2).await;
     });
 
+    let receipt = fetch_receipt(&pool, receipt_id, auth.user_id).await?;
     Ok((StatusCode::CREATED, Json(receipt)))
 }
 
@@ -88,17 +108,17 @@ pub async fn list(
     Query(params): Query<ReceiptListQuery>,
 ) -> Result<Json<ReceiptListResponse>, AppError> {
     let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.per_page.unwrap_or(20).min(100);
+    let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
     let receipts = sqlx::query_as::<_, ReceiptSummary>(
-        "SELECT id, store_name, purchase_date, total, currency, ocr_status, created_at
+        "SELECT id, store_name_raw, purchase_at, total, currency, extraction_status, created_at
          FROM receipts
          WHERE user_id = $1
-           AND ($2::text IS NULL OR store_name ILIKE '%' || $2 || '%')
-           AND ($3::date IS NULL OR purchase_date >= $3)
-           AND ($4::date IS NULL OR purchase_date <= $4)
-         ORDER BY created_at DESC
+           AND ($2::text IS NULL OR store_name_raw ILIKE '%' || $2 || '%')
+           AND ($3::date IS NULL OR purchase_at::date >= $3)
+           AND ($4::date IS NULL OR purchase_at::date <= $4)
+         ORDER BY COALESCE(purchase_at, created_at) DESC
          LIMIT $5 OFFSET $6",
     )
     .bind(auth.user_id)
@@ -113,9 +133,9 @@ pub async fn list(
     let total_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM receipts
          WHERE user_id = $1
-           AND ($2::text IS NULL OR store_name ILIKE '%' || $2 || '%')
-           AND ($3::date IS NULL OR purchase_date >= $3)
-           AND ($4::date IS NULL OR purchase_date <= $4)",
+           AND ($2::text IS NULL OR store_name_raw ILIKE '%' || $2 || '%')
+           AND ($3::date IS NULL OR purchase_at::date >= $3)
+           AND ($4::date IS NULL OR purchase_at::date <= $4)",
     )
     .bind(auth.user_id)
     .bind(&params.store)
@@ -135,36 +155,26 @@ pub async fn get_one(
     State(pool): State<PgPool>,
     State(storage): State<Storage>,
     Path(id): Path<Uuid>,
-) -> Result<Json<ReceiptWithItems>, AppError> {
-    let receipt = sqlx::query_as::<_, Receipt>(
-        "SELECT id, user_id, store_name, purchase_date, purchase_time,
-                total, subtotal, currency, image_key, ocr_confidence,
-                ocr_status, created_at, updated_at
-         FROM receipts WHERE id = $1 AND user_id = $2",
-    )
-    .bind(id)
-    .bind(auth.user_id)
-    .fetch_optional(&pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
+) -> Result<Json<ReceiptWithTransactions>, AppError> {
+    let receipt = fetch_receipt(&pool, id, auth.user_id).await?;
 
-    let items = sqlx::query_as::<_, Item>(
-        "SELECT id, receipt_id, description, quantity, unit_price, line_total, product_code
-         FROM items WHERE receipt_id = $1
-         ORDER BY created_at",
+    let transactions = sqlx::query_as::<_, Transaction>(
+        "SELECT id, receipt_id, description_raw, description_clean, item_type,
+                quantity, unit, unit_price, line_total, mva_rate
+         FROM transactions WHERE receipt_id = $1 ORDER BY line_no NULLS LAST, id",
     )
     .bind(id)
     .fetch_all(&pool)
     .await?;
 
-    let image_url = storage
-        .get_presigned_url(&receipt.image_key, 3600)
-        .await
-        .ok();
+    let image_url = match &receipt.original_asset_key {
+        Some(key) => storage.get_presigned_url(key, 3600).await.ok(),
+        None => None,
+    };
 
-    Ok(Json(ReceiptWithItems {
+    Ok(Json(ReceiptWithTransactions {
         receipt,
-        items,
+        transactions,
         image_url,
     }))
 }
@@ -175,26 +185,23 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateReceiptRequest>,
 ) -> Result<Json<Receipt>, AppError> {
-    let receipt = sqlx::query_as::<_, Receipt>(
+    let receipt = sqlx::query_as::<_, Receipt>(&format!(
         "UPDATE receipts SET
-            store_name = COALESCE($3, store_name),
-            purchase_date = COALESCE($4, purchase_date),
+            store_name_raw = COALESCE($3, store_name_raw),
+            purchase_at = COALESCE($4, purchase_at),
             total = COALESCE($5, total),
             updated_at = now()
          WHERE id = $1 AND user_id = $2
-         RETURNING id, user_id, store_name, purchase_date, purchase_time,
-                   total, subtotal, currency, image_key, ocr_confidence,
-                   ocr_status, created_at, updated_at",
-    )
+         RETURNING {RECEIPT_COLS}"
+    ))
     .bind(id)
     .bind(auth.user_id)
     .bind(&req.store_name)
-    .bind(req.purchase_date)
+    .bind(req.purchase_at)
     .bind(req.total)
     .fetch_optional(&pool)
     .await?
     .ok_or(AppError::NotFound)?;
-
     Ok(Json(receipt))
 }
 
@@ -204,8 +211,8 @@ pub async fn delete(
     State(storage): State<Storage>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "DELETE FROM receipts WHERE id = $1 AND user_id = $2 RETURNING image_key",
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "DELETE FROM receipts WHERE id = $1 AND user_id = $2 RETURNING original_asset_key",
     )
     .bind(id)
     .bind(auth.user_id)
@@ -213,56 +220,27 @@ pub async fn delete(
     .await?;
 
     match row {
-        Some((key,)) => {
+        Some((Some(key),)) => {
             let _ = storage.delete(&key).await;
             Ok(StatusCode::NO_CONTENT)
         }
+        Some((None,)) => Ok(StatusCode::NO_CONTENT),
         None => Err(AppError::NotFound),
     }
 }
 
-pub async fn ocr_status(
+pub async fn status(
     auth: AuthUser,
     State(pool): State<PgPool>,
-    State(ocr_client): State<Arc<TabscannerClient>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<OcrStatusResponse>, AppError> {
-    let row = sqlx::query_as::<_, (String, Option<f32>, Option<String>)>(
-        "SELECT ocr_status, ocr_confidence, ocr_token FROM receipts WHERE id = $1 AND user_id = $2",
+) -> Result<Json<ExtractionStatusResponse>, AppError> {
+    let row = sqlx::query_as::<_, ExtractionStatusResponse>(
+        "SELECT extraction_status, extraction_conf FROM receipts WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(auth.user_id)
     .fetch_optional(&pool)
     .await?
     .ok_or(AppError::NotFound)?;
-
-    let (mut status, confidence, ocr_token) = row;
-
-    // If still processing and we have a token, lazy-poll Tabscanner
-    if status == "processing" {
-        if let Some(token) = &ocr_token {
-            match ocr::poll_and_store(&pool, id, auth.user_id, token, &ocr_client).await {
-                Ok(new_status) => status = new_status,
-                Err(e) => tracing::warn!("OCR poll failed for receipt {id}: {e}"),
-            }
-        }
-    }
-
-    // Re-read confidence if status changed to done
-    let confidence = if status == "done" && confidence.is_none() {
-        sqlx::query_scalar::<_, Option<f32>>(
-            "SELECT ocr_confidence FROM receipts WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(None)
-    } else {
-        confidence
-    };
-
-    Ok(Json(OcrStatusResponse {
-        ocr_status: status,
-        ocr_confidence: confidence,
-    }))
+    Ok(Json(row))
 }

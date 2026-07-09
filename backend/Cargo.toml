@@ -2,6 +2,7 @@
 name = "kvitteringsapp-backend"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 # Web framework
@@ -32,13 +33,20 @@ argon2 = "0.5"
 # S3
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 
-# HTTP client (Tabscanner API)
+# HTTP client (local VLM / Ollama / vLLM)
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 
 # Types
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# Extraction / hashing
+async-trait = "0.1"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
 
 # Utilities
 dotenvy = "0.15"

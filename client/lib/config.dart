@@ -1,6 +1,8 @@
 class AppConfig {
-  static const String apiBaseUrl = 'http://10.0.2.2:3000'; // Android emulator -> host
-  // For iOS simulator: 'http://localhost:3000'
-  // For web: 'http://localhost:3000'
-  // For physical device: use your machine's LAN IP
+  /// Backend base URL. Override at build/run time with
+  /// `--dart-define=API_BASE=https://your.host`.
+  static const String apiBaseUrl = String.fromEnvironment(
+    'API_BASE',
+    defaultValue: 'http://localhost:3000',
+  );
 }

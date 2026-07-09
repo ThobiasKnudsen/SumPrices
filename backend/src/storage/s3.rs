@@ -3,9 +3,28 @@ use std::sync::Arc;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
+use s3::BucketConfiguration;
 
 use crate::config::Config;
 use crate::errors::AppError;
+
+fn region_of(config: &Config) -> Region {
+    Region::Custom {
+        region: config.s3_region.clone(),
+        endpoint: config.s3_endpoint.clone(),
+    }
+}
+
+fn credentials_of(config: &Config) -> Result<Credentials, AppError> {
+    Credentials::new(
+        Some(&config.s3_access_key),
+        Some(&config.s3_secret_key),
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| AppError::Internal(format!("Failed to create S3 credentials: {e}")))
+}
 
 #[derive(Clone)]
 pub struct Storage {
@@ -13,6 +32,27 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Create the bucket if it does not already exist. Best-effort: an
+    /// "already owned / exists" response from MinIO is treated as success.
+    pub async fn ensure_bucket(config: &Config) -> Result<(), AppError> {
+        let creds = credentials_of(config)?;
+        match Bucket::create_with_path_style(
+            &config.s3_bucket,
+            region_of(config),
+            creds,
+            BucketConfiguration::default(),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Bucket likely already exists; log and continue.
+                tracing::warn!("ensure_bucket({}): {e}", config.s3_bucket);
+                Ok(())
+            }
+        }
+    }
+
     pub fn new(config: &Config) -> Self {
         let region = Region::Custom {
             region: config.s3_region.clone(),

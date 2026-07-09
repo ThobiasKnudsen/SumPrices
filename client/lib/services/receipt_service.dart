@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
@@ -10,12 +10,19 @@ class ReceiptService {
 
   ReceiptService(this._api);
 
-  Future<Receipt> upload(File imageFile) async {
+  /// Uploads a receipt as raw bytes (web-safe, no `dart:io`).
+  ///
+  /// Images (jpg/png/webp) are sent under the multipart field `image`; PDFs are
+  /// sent under `pdf`, chosen by the file extension.
+  Future<Receipt> upload({
+    required Uint8List bytes,
+    required String filename,
+  }) async {
+    final isPdf = filename.toLowerCase().endsWith('.pdf');
+    final field = isPdf ? 'pdf' : 'image';
+
     final formData = FormData.fromMap({
-      'image': await MultipartFile.fromFile(
-        imageFile.path,
-        filename: 'receipt.jpg',
-      ),
+      field: MultipartFile.fromBytes(bytes, filename: filename),
     });
 
     final response = await _api.dio.post(
@@ -32,6 +39,7 @@ class ReceiptService {
     String? store,
     String? from,
     String? to,
+    String? status,
   }) async {
     final response = await _api.dio.get('/api/receipts', queryParameters: {
       'page': page,
@@ -39,6 +47,7 @@ class ReceiptService {
       if (store != null) 'store': store,
       if (from != null) 'from': from,
       if (to != null) 'to': to,
+      if (status != null) 'status': status,
     });
     return ReceiptListResponse.fromJson(response.data);
   }
@@ -57,8 +66,8 @@ class ReceiptService {
     await _api.dio.delete('/api/receipts/$id');
   }
 
-  Future<OcrStatus> checkOcrStatus(String id) async {
+  Future<ExtractionStatus> checkExtractionStatus(String id) async {
     final response = await _api.dio.get('/api/receipts/$id/status');
-    return OcrStatus.fromJson(response.data);
+    return ExtractionStatus.fromJson(response.data);
   }
 }

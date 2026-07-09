@@ -1,59 +1,60 @@
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::enums::{ExtractionStatus, ItemType};
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct Receipt {
     pub id: Uuid,
     pub user_id: Uuid,
-    pub store_name: Option<String>,
-    pub purchase_date: Option<NaiveDate>,
-    pub purchase_time: Option<NaiveTime>,
-    pub total: Option<Decimal>,
+    pub store_name_raw: Option<String>,
+    pub purchase_at: Option<DateTime<Utc>>,
     pub subtotal: Option<Decimal>,
+    pub mva_total: Option<Decimal>,
+    pub total: Option<Decimal>,
     pub currency: String,
-    pub image_key: String,
-    pub ocr_confidence: Option<f32>,
-    pub ocr_status: String,
+    pub extraction_status: ExtractionStatus,
+    pub extraction_conf: Option<f32>,
+    pub needs_review: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip)]
+    pub original_asset_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct ReceiptSummary {
     pub id: Uuid,
-    pub store_name: Option<String>,
-    pub purchase_date: Option<NaiveDate>,
+    pub store_name_raw: Option<String>,
+    pub purchase_at: Option<DateTime<Utc>>,
     pub total: Option<Decimal>,
     pub currency: String,
-    pub ocr_status: String,
+    pub extraction_status: ExtractionStatus,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
-pub struct Item {
-    pub id: Uuid,
+pub struct Transaction {
+    pub id: i64,
     pub receipt_id: Uuid,
-    pub description: String,
-    pub quantity: Option<f32>,
+    pub description_raw: String,
+    pub description_clean: Option<String>,
+    pub item_type: ItemType,
+    pub quantity: Option<Decimal>,
+    pub unit: Option<String>,
     pub unit_price: Option<Decimal>,
     pub line_total: Option<Decimal>,
-    pub product_code: Option<String>,
+    pub mva_rate: Option<Decimal>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ReceiptWithItems {
+pub struct ReceiptWithTransactions {
     #[serde(flatten)]
     pub receipt: Receipt,
-    pub items: Vec<Item>,
+    pub transactions: Vec<Transaction>,
     pub image_url: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReceiptListResponse {
-    pub receipts: Vec<ReceiptSummary>,
-    pub total_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,17 +64,24 @@ pub struct ReceiptListQuery {
     pub store: Option<String>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReceiptListResponse {
+    pub receipts: Vec<ReceiptSummary>,
+    pub total_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateReceiptRequest {
     pub store_name: Option<String>,
-    pub purchase_date: Option<NaiveDate>,
+    pub purchase_at: Option<DateTime<Utc>>,
     pub total: Option<Decimal>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct OcrStatusResponse {
-    pub ocr_status: String,
-    pub ocr_confidence: Option<f32>,
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ExtractionStatusResponse {
+    pub extraction_status: ExtractionStatus,
+    pub extraction_conf: Option<f32>,
 }

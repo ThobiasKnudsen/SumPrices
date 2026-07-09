@@ -6,6 +6,7 @@ pub struct UserResponse {
     pub id: Uuid,
     pub email: String,
     pub display_name: Option<String>,
+    pub credit_balance: i32,
 }
 
 #[derive(Debug, Deserialize)]
