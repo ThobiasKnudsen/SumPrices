@@ -322,6 +322,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 - **`devices`** — push-notification tokens (when notifications ship).
 - **`store_aliases`** — raw store-name → `store_id` resolution (part of the later identity-resolution flow, alongside `raw_text_mappings`).
 - **`receipt_tags` / notes** — user annotations on receipts.
+- **Item-enrichment tables** (`item_contributions`, `info_requests`, `contribution_verifications`) + KYC fields — the crowdsourced-enrichment vision (§14).
 
 ## 8. GDPR & compliance (hard constraints)
 
@@ -351,7 +352,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 - Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
 
 **Later**
-- Email/mailbox digital-receipt ingestion; item-uncertainty **resolution flow** + per-store `raw_text_mappings` (crowd/vote); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; international expansion.
+- Email/mailbox digital-receipt ingestion; item-uncertainty **resolution flow** + per-store `raw_text_mappings` (crowd/vote); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
 
 ## 12. Open items / next steps
 
@@ -388,3 +389,20 @@ Not built at MVP; documented so we don't rediscover the need later:
 | 2026-07-09 | Layered anti-fraud (phash + signatures + arithmetic gate + idempotent ledger), stronger than a hash | Credit has spendable value; asset accrues in `transactions` |
 | 2026-07-09 | Price modeled per line as **net paid** + optional **shelf price / discount** + a `price_type` tag (shelf/promo/member/coupon/net_only); index compares store-set prices | Same item has several prices at once (member/coupon/promo); model receipt-visible cases, degrade to net_only |
 | 2026-07-09 | Chain loyalty rebates (1–3 % basket cashback) out of per-item price scope | Basket-level perk paid later, not a per-item price |
+| 2026-07-09 | **Progressive KYC** — basic scanning/earning stays open; identity verification gates only high-value contributions / cash-out / elevated trust (provider-based, store status only, never ID docs) | Corruption-resistance without killing the funnel or holding identity data |
+| 2026-07-09 | `trust_score` = earned from contributions proving true over time (corroboration); crowdsourced enrichment + bounty economy captured as vision (§14) | Hard-to-corrupt data moat; phased, post-MVP |
+
+## 14. Future vision — crowdsourced item enrichment & reputation
+
+> **Post-MVP, directional.** Captured so we don't design the foundations into a corner. The MVP already accommodates it: `credit_ledger.reason` is an extensible enum, `users.trust_score` exists, and `products` + `raw_text_mappings` establish the crowdsourcing pattern. No MVP changes needed.
+
+Beyond receipts, SummPrices can become a **crowdsourced product-knowledge graph** — users earn credit not only for scanning but for *enriching* items, can *request* information, and a reputation system makes the data hard to corrupt.
+
+- **Contributions (earn credit by enriching an item):** ingredients-list photo, a general product photo, weight / dimensions, a manual (furniture / Lego), etc. → a flexible `item_contributions` table (`product_id`, `attribute_type`, value / `asset_key`, `contributed_by`, `confidence`, verification status). Typed, so new attribute types are config, not migrations.
+- **Requests & demand-driven bounties:** users *request* a missing attribute (`info_requests`); **reward scales with demand** (more distinct requesters for the same attribute → higher credit) **and difficulty** (a photo is easy; provenance is hard). Fulfilment credits the contributor via a new `credit_ledger.reason` (`contribution_reward` / `bounty_reward`).
+- **Trust & truth-over-time:** `trust_score` is earned from **how often a user's past contributions later prove true** as data accumulates — independent contributors corroborate; matching the emerging consensus raises trust, contradicting it lowers it. Higher trust → contributions weighted more + access to higher-value bounties. *Genuinely hard (crowdsourced truth discovery + Sybil/collusion resistance) — phase it: simple corroboration + reputation first, evolve.*
+- **KYC — progressive, never a gate on basic use:** high-trust actions (high-value contributions, cash-out, elevated trust) require identity verification, but **basic scanning/earning stays open** or the acquisition funnel dies. Use a **provider** (Vipps / BankID in Norway; Stripe Identity abroad) and store only `kyc_status` + a provider reference — **never** identity documents (GDPR / security).
+- **Provenance caveat:** country-of-origin / "where produced" is hard to verify and easy to fake — mark such attributes low-confidence with stronger corroboration, or defer (dropping it for now is reasonable).
+- **Anti-gaming:** fake requests, collusion rings, and self-fulfilment are resisted by KYC + `trust_score` weighting + rate limits + the same idempotent, auditable `credit_ledger`.
+
+**Future tables:** `item_contributions`, `contribution_types`, `info_requests` (+ demand count), `contribution_verifications`; KYC fields on `users` (`kyc_status`, `kyc_ref`); new `credit_ledger.reason` values.
