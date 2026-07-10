@@ -18,6 +18,7 @@ pub mod mock;
 pub struct ExtractedLineItem {
     pub description_raw: String,
     pub description_clean: Option<String>,
+    pub product_code: Option<String>, // EAN/barcode when printed
     pub item_type: ItemType,
     pub quantity: Option<Decimal>,
     pub unit: Option<String>,
@@ -33,6 +34,8 @@ pub struct ExtractedLineItem {
 pub struct ExtractedReceipt {
     pub store_name_raw: Option<String>,
     pub org_no: Option<String>,
+    pub receipt_number: Option<String>,
+    pub payment_method: Option<String>, // card | cash | vipps | ... (never card digits)
     pub purchase_at: Option<DateTime<Utc>>,
     pub currency: String,
     pub subtotal: Option<Decimal>,
@@ -41,7 +44,7 @@ pub struct ExtractedReceipt {
     pub line_items: Vec<ExtractedLineItem>,
     pub confidence: Option<f32>,
     pub engine: String,
-    pub raw: serde_json::Value,
+    pub raw: serde_json::Value, // the model's receipt JSON (store address, mva_lines, payment, … live here)
 }
 
 #[async_trait::async_trait]
@@ -56,6 +59,7 @@ pub fn build_from_env(config: &Config) -> Arc<dyn ReceiptExtractor> {
         "hosted" => Arc::new(hosted_vlm::HostedVlmExtractor::new(
             &config.vlm_url,
             &config.vlm_model,
+            config.vlm_api_key.clone(),
         )),
         _ => Arc::new(mock::MockExtractor::new()),
     }

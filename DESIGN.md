@@ -62,7 +62,7 @@ React web app  ──HTTPS──> axum backend (modular monolith) ──> Postgr
 ## 6. Receipt extraction pipeline
 
 **Goal:** receipt image (or digital PDF) → validated structured JSON:
-`{ store, org_no, purchase_datetime, currency, line_items[{desc, qty, unit_price, line_total, category?}], subtotal, mva_lines[{rate, base, vat}], total }`.
+`{ store{name,org_no,address,city,postal_code,country_code}, purchase_at, currency, receipt_number, payment{method}, subtotal, total, mva_lines[{rate,base,vat}], line_items[{description, product_code, quantity, unit, shelf_unit_price, unit_price, discount_amount, line_total, item_type, price_type, mva_rate}] }` (the full v2 shape lives in `extraction/hosted_vlm.rs`'s prompt). Key fields are promoted to columns (`receipts.receipt_number`, `transactions.product_code`, …); the whole JSON is kept in `receipts.raw_extraction`.
 
 **Tiered flow (behind `ReceiptExtractor`):**
 1. **Structured import first** where possible — a **digital PDF with a text layer** is parsed directly (no OCR). *Manual PDF upload is a launch feature; email/mailbox ingestion is later.*
@@ -77,7 +77,8 @@ React web app  ──HTTPS──> axum backend (modular monolith) ──> Postgr
 - OCR-only specialists (PaddleOCR-VL-0.9B, dots.ocr, PP-OCRv5) output page text/markdown, not our schema — optional as a cheap pre-filter or a VRAM-saving 2-stage path, not the primary.
 
 **Serving & deployment:**
-- **Serving:** **Ollama** for the MVP (single binary, OpenAI-compatible endpoint, native `json_schema` structured output) → migrate to **vLLM** (guided-JSON + continuous batching) at volume. Backend calls it over `localhost` via `reqwest`. Enforce JSON with constrained decoding; validate server-side before any DB write.
+- **Engine (chosen):** the extractor calls **any OpenAI-compatible vision endpoint** — env `EXTRACTOR=hosted`, `VLM_URL`, `VLM_MODEL`, `VLM_API_KEY` (bearer). **Dev = OpenRouter** (one key; benchmark many vision models on real Norwegian receipts to pick the best). **Prod = EU-direct** (Mistral, Paris) before real users — receipts are sensitive; OpenRouter is a US router → not EU-resident. It's a config switch, no code change. `EXTRACTOR=mock` for tests/CI. Self-hosted Qwen3-VL on a rented GPU (below) remains an option.
+- **Serving (self-host option):** **Ollama** (single binary, OpenAI-compatible endpoint, native `json_schema` structured output) → migrate to **vLLM** (guided-JSON + continuous batching) at volume. Backend calls it via `reqwest`. Enforce JSON with constrained decoding; validate server-side before any DB write.
 - **GPU deployment: on-demand / scale-to-zero EU GPU.** Batch-drain the queue in warm windows. ~1k receipts/mo ≈ €2–3/mo; 10k/mo ≈ €25–30/mo. EU-sovereign per-second GPU (**Scaleway L4** Paris/Warsaw preferred; RunPod/Modal EU regions with a signed DPA). Migrate to an **always-on Hetzner** GPU (~€184/mo) only above ~66k receipts/mo. **Avoid fly.io** (GPUs deprecated after 2026-08-01).
 - **Job mechanism:** durable **Postgres `SELECT … FOR UPDATE SKIP LOCKED`** queue + background worker, so scans survive restarts and the GPU can batch-drain. (The repo's current OCR seam is fire-and-forget `tokio::spawn` + lazy polling — to be upgraded.)
 
@@ -394,6 +395,8 @@ Not built at MVP; documented so we don't rediscover the need later:
 | 2026-07-09 | Trust engine = weighted truth discovery (Dawid–Skene-style batch EM); **KYC = high prior weight, not an oracle**; reward = value-of-information; output = value + confidence | User's KYC-weighting idea, with guardrails against KYC-as-oracle and minority-suppression |
 | 2026-07-10 | MVP backend built + verified end-to-end (star schema, `ReceiptExtractor` trait mock/hosted, ingest harness, credits) | Commit 029ec07; runs on local Postgres + MinIO |
 | 2026-07-10 | **Web frontend = React + TypeScript SPA** (Vite + Tailwind + TanStack Query + Recharts); Flutter `client/` **removed** | Team prefers TS; cleaner web DX. Supersedes the earlier Flutter-web choice (§5/§10). Native mobile revisited later |
+| 2026-07-10 | Extraction engine = **any OpenAI-compatible vision API** (`VLM_API_KEY`). **Dev = OpenRouter**, **prod = EU-direct (Mistral)** before real users | OpenRouter = 1 key to benchmark many models; but US router → not EU-resident, so switch before real user data. Config switch, no code change |
+| 2026-07-10 | Receipt→JSON **v2 schema** (nested store+address, `receipt_number`, `mva_lines`, `payment.method` no card digits, per-line `product_code`/EAN) | Richer, validatable, seeds product identity; key fields promoted to columns, rest in `raw_extraction` |
 
 ## 14. Future vision — crowdsourced item enrichment & reputation
 

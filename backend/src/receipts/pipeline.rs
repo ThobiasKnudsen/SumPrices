@@ -88,6 +88,7 @@ pub async fn persist_extraction(
             extraction_conf = $10,
             extraction_status = $11,
             needs_review = $12,
+            receipt_number = $13,
             updated_at = now()
          WHERE id = $1",
     )
@@ -103,6 +104,7 @@ pub async fn persist_extraction(
     .bind(ex.confidence)
     .bind(status)
     .bind(needs_review)
+    .bind(&ex.receipt_number)
     .execute(pool)
     .await?;
 
@@ -115,9 +117,9 @@ pub async fn persist_extraction(
         sqlx::query(
             "INSERT INTO transactions
                 (receipt_id, user_id, occurred_at, line_no, description_raw, description_clean,
-                 item_type, quantity, unit, shelf_unit_price, unit_price, discount_amount,
-                 line_total, price_type, mva_rate)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+                 product_code, item_type, quantity, unit, shelf_unit_price, unit_price,
+                 discount_amount, line_total, price_type, mva_rate)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
         )
         .bind(receipt_id)
         .bind(user_id)
@@ -125,6 +127,7 @@ pub async fn persist_extraction(
         .bind(i as i32 + 1)
         .bind(&li.description_raw)
         .bind(&li.description_clean)
+        .bind(&li.product_code)
         .bind(li.item_type)
         .bind(li.quantity)
         .bind(&li.unit)

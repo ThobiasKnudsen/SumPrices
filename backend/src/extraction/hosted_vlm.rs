@@ -1,65 +1,95 @@
-//! Hosted Qwen3-VL extractor over an OpenAI-compatible endpoint (vLLM / Ollama).
+//! Hosted vision-LLM extractor over any OpenAI-compatible `/chat/completions`
+//! endpoint: OpenRouter or Mistral (dev/prod), or a self-hosted vLLM/Ollama.
+//! Set VLM_URL, VLM_MODEL, and VLM_API_KEY (bearer). No key → keyless (local).
 use base64::Engine;
 use serde::Deserialize;
 
 use crate::enums::{ItemType, PriceType};
 use crate::errors::AppError;
 
-use super::{dec2, dec3, parse_purchase_at, ExtractedLineItem, ExtractedReceipt, ReceiptExtractor};
+use super::{dec2, parse_purchase_at, ExtractedLineItem, ExtractedReceipt, ReceiptExtractor};
 
 pub struct HostedVlmExtractor {
     client: reqwest::Client,
     url: String,
     model: String,
+    api_key: Option<String>,
     engine: String,
 }
 
 impl HostedVlmExtractor {
-    pub fn new(url: &str, model: &str) -> Self {
+    pub fn new(url: &str, model: &str, api_key: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             url: url.trim_end_matches('/').to_string(),
             model: model.to_string(),
+            api_key,
             engine: model.to_string(),
         }
     }
 }
 
-const PROMPT: &str = r#"You are a receipt-parsing engine. Extract the receipt in the image into JSON with EXACTLY this shape (no extra keys, no prose):
+const PROMPT: &str = r#"You are a receipt-parsing engine. Extract the receipt in the image into JSON with EXACTLY this shape (no extra keys, no prose, no markdown):
 {
-  "store_name": string|null,
-  "org_no": string|null,
-  "purchase_datetime": string|null,
-  "currency": string,
+  "store": { "name": string|null, "org_no": string|null, "address": string|null, "city": string|null, "postal_code": string|null, "country_code": string|null },
+  "purchase_at": string|null,          // the printed local date/time, e.g. "2026-01-15T13:30" or "2026-01-15 13:30"
+  "currency": string,                  // e.g. "NOK"
+  "receipt_number": string|null,       // bong/receipt number if printed
+  "payment": { "method": string|null },// "card" | "cash" | "vipps" | ... (NEVER card numbers)
   "subtotal": number|null,
-  "mva_total": number|null,
   "total": number|null,
+  "mva_lines": [ { "rate": number, "base": number, "vat": number } ],  // the VAT/MVA breakdown table
   "line_items": [
     {
       "description": string,
+      "product_code": string|null,     // EAN/barcode if printed
       "quantity": number|null,
-      "unit": string|null,
-      "shelf_unit_price": number|null,
-      "unit_price": number|null,
+      "unit": string|null,             // "stk","kg","l"
+      "shelf_unit_price": number|null, // price before discount, if shown
+      "unit_price": number|null,       // net price actually paid per unit
       "discount_amount": number|null,
-      "line_total": number|null,
+      "line_total": number|null,       // net amount paid for the line
       "item_type": "product"|"deposit"|"discount"|"fee"|"rounding"|"unknown",
       "price_type": "shelf"|"promo"|"member"|"coupon"|"net_only",
-      "mva_rate": number|null
+      "mva_rate": number|null          // e.g. 25, 15, 12
     }
   ]
 }
-Norwegian receipts: comma is the decimal separator (49,90 = 49.90); "pant" lines are deposits (item_type "deposit"); "Rabatt"/"Trumf" lines are discounts (item_type "discount"). purchase_datetime is the printed local date/time. Output only the JSON object."#;
+Norwegian receipts: comma is the decimal separator (49,90 = 49.90); "pant" lines are deposits (item_type "deposit"); "Rabatt"/"Trumf" lines are discounts (item_type "discount"). Output only the JSON object."#;
+
+#[derive(Deserialize, Default)]
+struct VlmStore {
+    name: Option<String>,
+    org_no: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct VlmPayment {
+    method: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VlmMva {
+    #[allow(dead_code)]
+    rate: Option<f64>,
+    #[allow(dead_code)]
+    base: Option<f64>,
+    vat: Option<f64>,
+}
 
 #[derive(Deserialize)]
 struct VlmOut {
-    store_name: Option<String>,
-    org_no: Option<String>,
-    purchase_datetime: Option<String>,
+    #[serde(default)]
+    store: VlmStore,
+    purchase_at: Option<String>,
     currency: Option<String>,
+    receipt_number: Option<String>,
+    #[serde(default)]
+    payment: VlmPayment,
     subtotal: Option<f64>,
-    mva_total: Option<f64>,
     total: Option<f64>,
+    #[serde(default)]
+    mva_lines: Vec<VlmMva>,
     #[serde(default)]
     line_items: Vec<VlmItem>,
 }
@@ -67,6 +97,7 @@ struct VlmOut {
 #[derive(Deserialize)]
 struct VlmItem {
     description: Option<String>,
+    product_code: Option<String>,
     quantity: Option<f64>,
     unit: Option<String>,
     shelf_unit_price: Option<f64>,
@@ -99,25 +130,30 @@ fn price_type_of(s: &Option<String>) -> PriceType {
     }
 }
 
+fn empty_pdf_result(engine: &str) -> ExtractedReceipt {
+    ExtractedReceipt {
+        store_name_raw: None,
+        org_no: None,
+        receipt_number: None,
+        payment_method: None,
+        purchase_at: None,
+        currency: "NOK".to_string(),
+        subtotal: None,
+        mva_total: None,
+        total: None,
+        line_items: vec![],
+        confidence: Some(0.0),
+        engine: engine.to_string(),
+        raw: serde_json::json!({ "note": "pdf extraction not yet supported by hosted VLM" }),
+    }
+}
+
 #[async_trait::async_trait]
 impl ReceiptExtractor for HostedVlmExtractor {
     async fn extract(&self, bytes: &[u8], mime: &str) -> Result<ExtractedReceipt, AppError> {
         // PDFs can't be sent to a vision model directly; text-layer parsing is deferred.
-        // Return an empty result so the pipeline flags it needs_review.
         if mime == "application/pdf" {
-            return Ok(ExtractedReceipt {
-                store_name_raw: None,
-                org_no: None,
-                purchase_at: None,
-                currency: "NOK".to_string(),
-                subtotal: None,
-                mva_total: None,
-                total: None,
-                line_items: vec![],
-                confidence: Some(0.0),
-                engine: self.engine.clone(),
-                raw: serde_json::json!({ "note": "pdf extraction not yet supported by hosted VLM" }),
-            });
+            return Ok(empty_pdf_result(&self.engine));
         }
 
         let data_uri = format!(
@@ -138,10 +174,20 @@ impl ReceiptExtractor for HostedVlmExtractor {
             ]
         });
 
-        let resp = self
+        let mut req = self
             .client
             .post(format!("{}/chat/completions", self.url))
-            .json(&body)
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            // Bearer auth for OpenRouter/Mistral; the referer/title headers are
+            // what OpenRouter recommends for attribution and are ignored elsewhere.
+            req = req
+                .bearer_auth(key)
+                .header("HTTP-Referer", "https://summprices.app")
+                .header("X-Title", "SummPrices");
+        }
+
+        let resp = req
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("VLM request failed: {e}")))?;
@@ -161,6 +207,15 @@ impl ReceiptExtractor for HostedVlmExtractor {
             .ok_or_else(|| AppError::Internal("VLM response missing content".to_string()))?;
         let out: VlmOut = serde_json::from_str(content)
             .map_err(|e| AppError::Internal(format!("VLM JSON invalid: {e}")))?;
+        // Store the model's receipt JSON (store address, mva_lines, payment, …) for audit/reprocess.
+        let raw: serde_json::Value = serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
+
+        let mva_total = if out.mva_lines.is_empty() {
+            None
+        } else {
+            let sum: f64 = out.mva_lines.iter().filter_map(|m| m.vat).sum();
+            dec2(Some(sum))
+        };
 
         let line_items = out
             .line_items
@@ -170,8 +225,9 @@ impl ReceiptExtractor for HostedVlmExtractor {
                 Some(ExtractedLineItem {
                     description_clean: Some(desc.clone()),
                     description_raw: desc,
+                    product_code: it.product_code,
                     item_type: item_type_of(&it.item_type),
-                    quantity: dec3(it.quantity),
+                    quantity: super::dec3(it.quantity),
                     unit: it.unit,
                     shelf_unit_price: dec2(it.shelf_unit_price),
                     unit_price: dec2(it.unit_price),
@@ -184,17 +240,19 @@ impl ReceiptExtractor for HostedVlmExtractor {
             .collect();
 
         Ok(ExtractedReceipt {
-            store_name_raw: out.store_name,
-            org_no: out.org_no,
-            purchase_at: parse_purchase_at(out.purchase_datetime.as_deref()),
+            store_name_raw: out.store.name,
+            org_no: out.store.org_no,
+            receipt_number: out.receipt_number,
+            payment_method: out.payment.method,
+            purchase_at: parse_purchase_at(out.purchase_at.as_deref()),
             currency: out.currency.unwrap_or_else(|| "NOK".to_string()),
             subtotal: dec2(out.subtotal),
-            mva_total: dec2(out.mva_total),
+            mva_total,
             total: dec2(out.total),
             line_items,
             confidence: None,
             engine: self.engine.clone(),
-            raw: val,
+            raw,
         })
     }
 

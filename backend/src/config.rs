@@ -11,8 +11,9 @@ pub struct Config {
     pub s3_region: String,
     // Extraction
     pub extractor: String, // "mock" | "hosted"
-    pub vlm_url: String,   // OpenAI-compatible endpoint (vLLM / Ollama)
+    pub vlm_url: String,   // OpenAI-compatible endpoint (OpenRouter / Mistral / vLLM / Ollama)
     pub vlm_model: String,
+    pub vlm_api_key: Option<String>, // bearer key for hosted APIs (OpenRouter/Mistral); None for local
     pub dev_receipts_dir: String,
 }
 
@@ -30,6 +31,7 @@ impl Config {
             extractor: env::var("EXTRACTOR").unwrap_or_else(|_| "mock".to_string()),
             vlm_url: env::var("VLM_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
             vlm_model: env::var("VLM_MODEL").unwrap_or_else(|_| "qwen3-vl:8b".to_string()),
+            vlm_api_key: env::var("VLM_API_KEY").ok().filter(|s| !s.is_empty()),
             dev_receipts_dir: env::var("DEV_RECEIPTS_DIR").unwrap_or_else(|_| "dev_receipts".to_string()),
         }
     }

@@ -1,4 +1,4 @@
-//! Deterministic extractor for tests / CI / no-GPU dev. Returns a fixed Norwegian receipt.
+//! Deterministic extractor for tests / CI / no-key dev. Returns a fixed Norwegian receipt.
 use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
 
@@ -19,10 +19,11 @@ impl MockExtractor {
     }
 }
 
-fn product(desc: &str, unit_price: Decimal) -> ExtractedLineItem {
+fn product(desc: &str, ean: &str, unit_price: Decimal) -> ExtractedLineItem {
     ExtractedLineItem {
         description_raw: desc.to_string(),
         description_clean: Some(desc.to_string()),
+        product_code: Some(ean.to_string()),
         item_type: ItemType::Product,
         quantity: Some(Decimal::ONE),
         unit: Some("stk".to_string()),
@@ -44,11 +45,12 @@ impl ReceiptExtractor for MockExtractor {
         let total = milk + bread + pant; // 67.80
 
         let line_items = vec![
-            product("MELK LETT 1.5L", milk),
-            product("BROD GROVT", bread),
+            product("MELK LETT 1.5L", "7038010009457", milk),
+            product("BROD GROVT", "7035620004612", bread),
             ExtractedLineItem {
                 description_raw: "PANT".to_string(),
                 description_clean: Some("Pant".to_string()),
+                product_code: None,
                 item_type: ItemType::Deposit,
                 quantity: Some(Decimal::ONE),
                 unit: None,
@@ -64,6 +66,8 @@ impl ReceiptExtractor for MockExtractor {
         Ok(ExtractedReceipt {
             store_name_raw: Some("KIWI Storgata".to_string()),
             org_no: Some("NO123456789MVA".to_string()),
+            receipt_number: Some("MOCK-0001".to_string()),
+            payment_method: Some("card".to_string()),
             purchase_at: Utc.with_ymd_and_hms(2026, 1, 15, 13, 30, 0).single(),
             currency: "NOK".to_string(),
             subtotal: Some(total),
