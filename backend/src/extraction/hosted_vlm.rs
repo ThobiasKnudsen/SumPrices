@@ -130,6 +130,15 @@ fn price_type_of(s: &Option<String>) -> PriceType {
     }
 }
 
+/// Extract the outermost JSON object from a model response that may wrap it in
+/// markdown fences (```json … ```) or prose.
+fn extract_json_object(s: &str) -> &str {
+    match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if b >= a => &s[a..=b],
+        _ => s.trim(),
+    }
+}
+
 fn empty_pdf_result(engine: &str) -> ExtractedReceipt {
     ExtractedReceipt {
         store_name_raw: None,
@@ -174,29 +183,49 @@ impl ReceiptExtractor for HostedVlmExtractor {
             ]
         });
 
-        let mut req = self
-            .client
-            .post(format!("{}/chat/completions", self.url))
-            .json(&body);
-        if let Some(key) = &self.api_key {
-            // Bearer auth for OpenRouter/Mistral; the referer/title headers are
-            // what OpenRouter recommends for attribution and are ignored elsewhere.
-            req = req
-                .bearer_auth(key)
-                .header("HTTP-Referer", "https://summprices.app")
-                .header("X-Title", "SummPrices");
+        // Send with a few retries on transient rate-limits (429) / 5xx.
+        let endpoint = format!("{}/chat/completions", self.url);
+        let mut resp = None;
+        let mut last_err = String::new();
+        for attempt in 1..=3u32 {
+            let mut req = self.client.post(&endpoint).json(&body);
+            if let Some(key) = &self.api_key {
+                // Bearer auth for OpenRouter/Mistral; referer/title are OpenRouter
+                // attribution headers, ignored elsewhere.
+                req = req
+                    .bearer_auth(key)
+                    .header("HTTP-Referer", "https://summprices.app")
+                    .header("X-Title", "SummPrices");
+            }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {
+                    resp = Some(r);
+                    break;
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    let text = r.text().await.unwrap_or_default();
+                    last_err = format!("VLM returned {status}: {text}");
+                    if retryable && attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(800 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    return Err(AppError::Internal(last_err));
+                }
+                Err(e) => {
+                    last_err = format!("VLM request failed: {e}");
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(800 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    return Err(AppError::Internal(last_err));
+                }
+            }
         }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("VLM request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!("VLM returned {status}: {text}")));
-        }
+        let resp = resp.ok_or_else(|| AppError::Internal(last_err))?;
 
         let val: serde_json::Value = resp
             .json()
@@ -205,10 +234,12 @@ impl ReceiptExtractor for HostedVlmExtractor {
         let content = val["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| AppError::Internal("VLM response missing content".to_string()))?;
-        let out: VlmOut = serde_json::from_str(content)
+        // Tolerate markdown fences / prose around the JSON object.
+        let json_str = extract_json_object(content);
+        let out: VlmOut = serde_json::from_str(json_str)
             .map_err(|e| AppError::Internal(format!("VLM JSON invalid: {e}")))?;
         // Store the model's receipt JSON (store address, mva_lines, payment, …) for audit/reprocess.
-        let raw: serde_json::Value = serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
+        let raw: serde_json::Value = serde_json::from_str(json_str).unwrap_or(serde_json::Value::Null);
 
         let mva_total = if out.mva_lines.is_empty() {
             None
