@@ -2,7 +2,7 @@
 
 > Canonical design context for SumPrices. Read this first. It records **what we're building and why**, the **decisions made** (with rationale), and the **open items**. The existing repo code and any older "spec" documents are **out of date** relative to this file — this file wins.
 >
-> Last updated: 2026-07-09.
+> Last updated: 2026-07-11 (client/frontend split §5.1 + map feature §5.2; **mobile is the primary frontend**, web stays as dev + future-B2B surface).
 
 ---
 
@@ -15,6 +15,7 @@
 - **Price search** — spend credit to query the *crowd / aggregated* price data via the Price API (see §7.7).
 - **Digital receipts** — import machine-readable receipts (PDF), not only photos.
 - **Export** — select receipts and export them.
+- **Map of your shops** — see every shop you've bought from on a map; *your* shops always, others' shops appear once enough people have scanned there (§5.2).
 - **Later:** "am I overpaying vs other stores?" — unlocked once enough crowd data exists.
 
 **It is not** just groceries, and **not** a per-store tool — it's a universal archive of a person's purchases.
@@ -34,7 +35,7 @@
 2. **Two data domains, separated from day one** (§7):
    - **Operational / PII** — users, receipts, images, their line-item transactions. Tied to identity.
    - **Anonymized crowd/price data** — derived from `transactions` (aggregated, **no user identity**). Materialized into a retained de-identified store only when B2B / retention needs it (§7.3).
-3. **Thin client.** The web app (React + TS SPA) = capture + upload + display + API calls. **No meaningful processing on the client** — Postgres, the backend, and the extraction service do the work.
+3. **Thin clients.** Both frontends — the **mobile app** (React Native + Expo; the *primary* consumer frontend) and the **web SPA** (React + TS; the dev-iteration surface now + the future B2B home) — do only capture + upload + display + API calls. **No meaningful processing on the client** — Postgres, the backend, and the extraction service do the work. (§5.1)
 4. **Extraction behind a `ReceiptExtractor` trait** — the model/provider is a swappable implementation detail (§6).
 5. **GDPR-first** (§8). Self-hosting the model and keeping all data in the EU is a deliberate compliance + product advantage.
 6. **Async by default.** Receipt extraction runs off the request path via a durable job queue.
@@ -42,7 +43,7 @@
 ## 5. System architecture
 
 ```
-React web app  ──HTTPS──> axum backend (modular monolith) ──> PostgreSQL
+Mobile + web   ──HTTPS──> axum backend (modular monolith) ──> PostgreSQL
    (thin: capture,             │  ├─ identity/auth               │  (operational/PII
     upload, display,           │  ├─ capture/ingest               │   + reference catalog
     API calls)                 │  ├─ extraction (trait)           │   + anonymized
@@ -50,14 +51,34 @@ React web app  ──HTTPS──> axum backend (modular monolith) ──> Postgr
                                │  ├─ price-index / Price API      │
                                │  └─ credits/ledger               │
                                │                                  
-                               ├──> Object storage (S3-compatible): receipt images
+                               ├──> Object storage (S3-compatible): receipt images + chain logos
                                └──> Extraction service: self-hosted VLM on on-demand EU GPU
                                      (Ollama/vLLM, OpenAI-compatible localhost endpoint)
 ```
 
 - **Backend:** Rust, axum 0.8, sqlx 0.8 (Postgres, compile-time-checked), argon2 + JWT auth, `rust-s3` for object storage.
-- **Client:** React + TypeScript SPA (Vite, Tailwind). *(Flutter web MVP was replaced; native mobile revisited later.)*
+- **Clients:** the **mobile app** (React Native + Expo, TS) is the *primary* consumer frontend; the **web SPA** (React + TS, Vite/Tailwind) is the dev-iteration + future-B2B surface — see §5.1. *(Supersedes the earlier web-only / "native mobile later" note.)*
 - **Object storage:** S3-compatible; receipt images keyed per user; presigned URLs for display.
+
+### 5.1 Clients / frontends
+
+Two thin frontends over the same axum JSON API; **the mobile app is the most important frontend** (the consumer product — scanning a paper receipt is phone-first), while the web app is what's actively built on *now*:
+
+- **Mobile app — primary consumer frontend. React Native + Expo (TypeScript).** Chosen to reuse the web app's React/TS skills, TanStack Query, API client and types; one codebase covers **iOS + Android** (mandatory — Norway is ~55–60 % iOS, neither platform can be an afterthought) without adding a third language beside Rust + TS. `react-native-vision-camera` for the scan screen (frame processors / live edge detection — the make-or-break UX surface for a receipt app); MapLibre for the map (§5.2). Ship via **EAS Build / Submit / Update** (cloud builds, OTA JS patches). RN's New-Architecture renderer + UI-thread animation make "indistinguishable-from-native" achievable for this app's shape (auth + camera + lists + detail + charts + map); "clean/premium" feel is ~90 % design execution, not framework ceiling. Native push (FCM/APNs) upgrades the §7.11 web-push reminder.
+- **Web SPA — dev surface now + future B2B home.** React + TS (Vite, Tailwind, React Router, TanStack Query, Recharts) in `web/`. It stays: it's the fastest thing to iterate on from a laptop today, and it's where the **B2B** Price-API dashboard will live (a while out). Consumer web is a *secondary* surface to the mobile app.
+- **Shared layer.** Both are thin (capture / upload / display / API only). Keep the API client + TS types shareable (monorepo direction: `apps/mobile` + `apps/web` around shared packages) so business logic isn't written twice.
+- **Replace-vs-alongside fork → alongside** (not replace): mobile is the flagship consumer app; the web app persists for dev + B2B.
+
+### 5.2 Map & geospatial feature
+
+One unified map of shops. **Pins are sourced from the address printed on the receipt** (geocoded), **not** from a business directory — so it works in **any country from day one** with zero per-country infrastructure (upholds "international-ready", §3), and the map stays signal-not-noise (only places someone actually shopped).
+
+- **Which shops show.** A shop appears **iff (a)** *you* scanned a receipt there — your own history, **always free** (§7.7) — **or (b)** enough *other* users scanned there for the crowd cell to clear the §7.3.1 risk gate. Below threshold, others' shops don't render (protects a lone scanner + removes noise).
+- **UX.** Small dots; **viewport-loaded** (a PostGIS bbox query — "all of Norway" stays cheap); **clustering** — nearby dots collapse into one with a **count badge (top-right)** showing how many shops are in that area. Tap a shop → **your purchase history there (free)** + a crowd items/prices panel behind a §7.7 **CreditGate** ("reveal for N credit"), the crowd data itself gated by §7.3.1.
+- **Shop names = normalization, not lookup.** The name is already on the receipt; normalize it onto the **`chains`** dimension via an alias step (`"REMA 1000 STORGATA 4"` → `"Rema 1000"`). Optional free enrichment = **OSM / Overture** reverse lookup (global `brand` data). **Not Google Places** (per-request billing + US processor/GDPR + ToS forbids storing results); **not** Google-Search scraping (ToS/brittle).
+- **Shop logos — permitted.** Showing a chain's logo to identify the store a user actually shopped at is **referential / nominative fair use** (EU **Art. 14 EUTMR** honest-practices; US nominative fair use) and is standard in banking / budgeting / receipt apps — it materially improves UX. Stored on `chains.logo_asset_key`. Guardrails: no implied endorsement/partnership, don't alter the mark, be **more careful on the B2B/marketing site**; copyright in the artwork is separate from the trademark argument, so **a quick legal check before real launch** is warranted (not legal advice).
+- **Data prerequisites / caveats.** Add the **PostGIS** extension to the existing Postgres (no separate DB). Geocode `stores.address → lat/long` on ingest (Kartverket for NO / Nominatim elsewhere). Two real caveats: **(1)** receipt addresses are messy / abbreviated / sometimes absent → graceful "not mappable yet"; **(2)** the same outlet can print different address strings → **dedup on `org_no`** (Norway) or a normalized name+address key (international), so one store = one pin.
+- **Build order.** The **personal** shop map is buildable now (only your own geocoded `stores`); the **crowd** shops ride on the same §7.3.1 / de-identification work already scoped — same UI, lit up later.
 
 ## 6. Receipt extraction pipeline
 
@@ -160,6 +181,7 @@ Tooling: `backend/src/bin/bench_extractors.rs` (score models on the reconciliati
 | id | UUID | PK | |
 | name | TEXT | NOT NULL, UNIQUE | 'Rema 1000', 'Kiwi', 'Coop Extra', … |
 | country_code | CHAR(2) | NOT NULL, default 'NO' | |
+| logo_asset_key | TEXT | | object-storage key of the chain logo — referential / nominative fair use (§5.2) |
 | created_at | TIMESTAMPTZ | NOT NULL, default now() | |
 
 **`stores`** — one row per physical outlet
@@ -172,9 +194,9 @@ Tooling: `backend/src/bin/bench_extractors.rs` (score models on the reconciliati
 | org_no | TEXT | | Norwegian org number (outlet / legal entity) |
 | country_code | CHAR(2) | NOT NULL, default 'NO' | |
 | address / city / postal_code | TEXT | | from the receipt when present |
-| latitude / longitude | DECIMAL(9,6) | | OSM geo |
+| latitude / longitude | DECIMAL(9,6) | | **geocoded from the receipt address** (§5.2; Kartverket/Nominatim); OSM/Overture only enriches |
 | timezone | TEXT | | IANA tz (e.g. 'Europe/Oslo') — used to compute `purchase_at` (§7.4) |
-| osm_id | TEXT | | |
+| osm_id | TEXT | | optional OSM/Overture match (brand / logo enrichment) |
 | created_at | TIMESTAMPTZ | NOT NULL, default now() | |
 
 *Indexes:* `chain_id`; `(latitude, longitude)`.
@@ -402,6 +424,7 @@ Because scanning earns spendable credit, dedup/anti-fraud is **layered** (strong
 
 - **Always free — personal domain:** viewing / searching your own `receipts` + `transactions`, your personal analytics, and *your own* price history for *your own* purchases. Looking at your own data is **never** gated.
 - **Credit-metered — crowd domain:** aggregate queries over everyone's `transactions` (§7.3) via the Price API — each query writes a `price_query` debit. Later, B2B access is the *same* surface, metered by money instead of earned credits.
+- **Credit-cost UX invariant (all consumer frontends).** Every credit-spending action **shows its exact cost on the control before it is spent** — a button literally reading **"8 credit"** — and nothing spends credit without an explicit tap (no silent / background debits). Built once as a reusable **CreditGate** component (mobile + web). The **B2B site is exempt** (billed by contract, not credit buttons).
 
 ### 7.8 Tables considered & deferred
 
@@ -520,18 +543,19 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 ## 10. Tech stack
 
 - **Backend:** Rust (edition 2024), axum 0.8, tokio, sqlx 0.8 (Postgres + compile-time checks), argon2, jsonwebtoken, `rust-s3`, reqwest.
-- **DB:** PostgreSQL (crowd prices derived from `transactions`; native partitioning + TimescaleDB later, if a retained price series is introduced).
-- **Client:** React + TypeScript SPA in `web/` (Vite + Tailwind + React Router + TanStack Query + Recharts).
+- **DB:** PostgreSQL (crowd prices derived from `transactions`; native partitioning + TimescaleDB later, if a retained price series is introduced); **PostGIS** extension for the map's spatial queries (bbox / radius) — no separate DB (§5.2).
+- **Mobile (primary frontend):** React Native + Expo (TypeScript) — `react-native-vision-camera` (scan screen), **MapLibre** (map); ship via EAS Build / Submit / Update (OTA). Reuses the web app's TS types + API client + TanStack Query (§5.1).
+- **Web (dev + future B2B):** React + TypeScript SPA in `web/` (Vite + Tailwind + React Router + TanStack Query + Recharts).
 - **Extraction:** self-hosted Qwen3-VL via Ollama → vLLM, on an on-demand EU GPU.
 - **Object storage:** S3-compatible.
 
 ## 11. Roadmap (phased)
 
 **Launch (MVP)**
-- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; **product resolution** (Tier-0/1 deterministic + `pg_trgm` Tier-2 guess + barcode-scan-for-credit, §7.10); **deferred-scan reminder** (pending-scans queue + web push + email, §7.11) with gamified credit feedback; personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan **+ barcode scan**); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
+- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; **product resolution** (Tier-0/1 deterministic + `pg_trgm` Tier-2 guess + barcode-scan-for-credit, §7.10); **deferred-scan reminder** (pending-scans queue + web push + email, §7.11) with gamified credit feedback; personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan **+ barcode scan**); basic price search as credit-metered aggregate queries over `transactions`; a **personal shop map** (your shops, geocoded from the receipt address, §5.2); export; GDPR basics (consent, export, delete-with-cascade). Frontends: the web SPA is the active dev surface, and the **mobile app** (React Native + Expo, §5.1) is the primary consumer frontend for the public launch.
 
 **Later**
-- Email/mailbox digital-receipt ingestion; **advanced product resolution** (embedding/semantic matcher, multi-user weighted-consensus, GTIN→Open Food Facts/GS1 enrichment, §7.10); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; **"money saved" metric** (§7.11 — provable→personal→market, phased); rich **native-mobile notifications** (FCM/APNs); international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
+- Email/mailbox digital-receipt ingestion; **advanced product resolution** (embedding/semantic matcher, multi-user weighted-consensus, GTIN→Open Food Facts/GS1 enrichment, §7.10); chain-API opt-in import; "overpaying" comparisons; the **crowd shop map** (others' shops once §7.3.1 clears) + chain logos; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; **"money saved" metric** (§7.11 — provable→personal→market, phased); rich **native-mobile notifications** (FCM/APNs); international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
 
 ## 12. Open items / next steps
 
@@ -539,8 +563,10 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 2. Norwegian **eval set** (~50–100 receipts) to validate Qwen3-VL 4B vs 8B before locking the model.
 3. Extraction worker (VLM + durable `SKIP LOCKED` queue on `receipts`).
 4. Price-API contract (filters, credit metering, and the B2B-access seam).
-5. Web client = React + TS SPA in `web/` (built); the Flutter `client/` was removed.
+5. **Frontends (§5.1):** the web SPA in `web/` (built) stays as the dev + future-B2B surface; **build the mobile app** (React Native + Expo) as the primary consumer frontend, sharing the TS types / API client (monorepo direction).
 6. **Extraction cost path (§6.1):** verify the real per-receipt bill → try Gemini Flash / per-token open VLM → self-host Qwen3-VL-8B on an EU L4 → LoRA-fine-tune on the `needs_review` label queue. Merge the `debug` branch (model picker, rescan, reconciliation, concurrency fixes) once reviewed.
+7. **Map feature (§5.2):** add PostGIS; geocode `stores.address → lat/long` on ingest (dedup on `org_no` / normalized address); ship the **personal** shop map first, then crowd shops gated by §7.3.1; store chain logos on `chains.logo_asset_key`; normalize shop names onto `chains`.
+8. **Mobile app (§5.1):** stand up React Native + Expo (vision-camera scan screen, MapLibre map, EAS pipeline); factor the shared API client / TS types out of `web/` into shared packages.
 
 ## 13. Decision log
 
@@ -585,6 +611,10 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 | 2026-07-11 | **Engagement loop (§7.11):** collect §7.10 barcode labels via a **deferred scan-reminder** ~10 min post-purchase (plain timer, not geofenced) → deep-link to the receipt → per-line claimable-credit buttons (VoI-weighted) → gamified credit feedback via §7.9 escrow. Delivery = **in-app pending-scans queue** (substrate, derived) **+ web push + email fallback**; rich native notifications later. Seams: `receipts.reminder_at`/`reminder_sent_at`, `push_subscriptions` (pulls deferred `devices` forward). **Money-saved metric DEFERRED** post-MVP (low value early, misleading-claim risk) but its 3 phased definitions (vs shelf / vs own usual / vs market) captured | User: notify when likely home (not at checkout); gamify credit; money-saved deferred — "not that important and not that reliable." Web-only push is weak on iOS, so the queue is the always-works substrate |
 | 2026-07-11 | **Product resolution (§7.10) is MVP:** receipt line → GTIN — the crowd index *depends* on it (raw strings fragment the asset; §7.3 previously assumed resolution existed but deferred it — inconsistency fixed). Cascade: Tier-0 EAN self-resolve → Tier-1 deterministic `(chain, product_code)` PLU map → Tier-2 `pg_trgm` probabilistic guess → Tier-3 **barcode-scan-for-credit** gold label (value-of-information reward, escrowed, corroborated). **Probabilistic guesses power *personal* freely but feed the *crowd* only on deterministic/corroborated resolution** (same two-gate rule as §7.9). New schema: `product_mappings` table (generalizes the old `raw_text_mappings`), `transactions.product_code`/`resolution_method`/`resolution_confidence`, `barcode_reward` reason | User flagged the gap; barcode scans are the ground-truth label flywheel (calibrate Tier-2, à la §6.1/§7.9); a scan is a claim → reuse §7.9 consensus + escrow anti-fraud |
 | 2026-07-11 | **Price API privacy model (§7.3.1):** aggregate-query-only (no per-receipt endpoint); per-item independent cells with a **no-co-occurrence** rule; availability by a re-id **risk formula** (`ρ=1/n`, Poisson population-uniqueness) not a fixed K; **differential privacy** (ε budget) on price *and* volume; resolution is a shared budget traded across area/time/price; enforced at the query layer + a locked-down DB role over the same `transactions` (no schema change; receipts stay full-detail per user) | User's design; makes the price domain provably *anonymous* not just pseudonymous, keeps it commercially useful, and needs no data duplication at MVP |
+| 2026-07-11 | **Mobile app (React Native + Expo, TS) = the primary consumer frontend**; the web SPA stays as the laptop dev-iteration surface + future B2B home → replace-vs-alongside resolved to **alongside** (§5.1) | Scanning a paper receipt is phone-first, so the flagship consumer product is mobile; RN reuses the web's React/TS + TanStack Query + API client and covers iOS+Android from one codebase (Norway ~55–60 % iOS). **Supersedes** the 2026-07-10 "native mobile revisited later" note |
+| 2026-07-11 | **Map feature (§5.2):** shop pins **geocoded from the receipt address** (no business directory); a shop shows iff *you* scanned there (free) or others' scans clear §7.3.1 (crowd); clustered dots w/ count badge, viewport-loaded via **PostGIS**; MapLibre tiles | Address-sourced pins are international-ready with zero per-country infra and keep the map signal-not-noise; the crowd side reuses the §7.3.1 privacy gate. **Rejected Google Places** (per-request billing + US processor + ToS bars storing results) |
+| 2026-07-11 | **Shop logos allowed** to identify the actual store (referential / nominative fair use; **EU Art. 14 EUTMR** honest-practices), stored on `chains.logo_asset_key`; shop names **normalized onto `chains`**, not looked up | Better UX, standard in banking / receipt apps. Guardrails: no implied endorsement, don't alter, careful on the B2B site → quick legal check before launch. Supersedes the earlier "can't use logos" assumption |
+| 2026-07-11 | **Credit-cost UX invariant (§7.7):** every credit-spending action shows its exact cost on the control ("8 credit") + needs an explicit tap; one reusable **CreditGate** across all consumer frontends; **B2B site exempt** | User: "this MUST be the case everywhere in all frontends" — transparent pre-purchase disclosure, no silent credit spend |
 
 ## 14. Future vision — crowdsourced item enrichment & reputation
 
