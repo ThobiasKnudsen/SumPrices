@@ -84,6 +84,40 @@ React web app  ──HTTPS──> axum backend (modular monolith) ──> Postgr
 
 **Non-negotiable before locking a model:** no model has a published **Norwegian-receipt benchmark**. Build a **~50–100 real Norwegian receipt eval set** (Rema/Kiwi/Coop + restaurant/furniture/electronics, incl. faded thermal) and measure line-item / MVA / total accuracy first.
 
+### 6.1 Extraction model & cost — benchmarked/researched 2026-07-11
+
+*Refines the pre-benchmark plan above with real measurements. Most of this ships on the `debug` branch (not yet on `main`).*
+
+**Benchmark — 9 real receipts (NO/DK/CH), scored on the reconciliation gate, via OpenRouter:**
+
+| Model | Reconciled to total | Notes |
+|---|---|---|
+| `google/gemini-2.5-pro` | **8/9** | best; fixes the mix-discount, `KORR`-correction, and price-column-misalignment failures the smaller models make |
+| `qwen/qwen-2.5-vl-72b-instruct` | ~5/9 | best **open-weight**; matches gpt-4o |
+| `openai/gpt-4o` | ~5/9 | |
+| `openai/gpt-4o-mini` (earlier default) | worse | misread prices/totals, hallucinated store names |
+| `anthropic/claude-3.7-sonnet` | — | **404 on our OpenRouter account** (Anthropic not enabled) |
+
+Tooling: `backend/src/bin/bench_extractors.rs` (score models on the reconciliation metric) and `reprocess_all.rs` (re-extract stored receipts from DB+storage for any account). In-app **debug model picker** (`GET /api/debug/models`, `VLM_MODELS` env) + per-receipt **Rescan** and bulk **Rescan-all** (`POST /api/debug/reprocess-all`) A/B models on live receipts.
+
+**Current state:** default `VLM_MODEL=google/gemini-2.5-pro` (dev, via OpenRouter — **US router, NOT EU-resident → temporary**; move to EU-direct or self-hosted before real users).
+
+**The reconciliation gate is the cost lever (implemented).** `pipeline::compute_review` sums signed line totals vs the printed total (±0.55 rounding) → flags `needs_review` with a reason; the VLM also self-reports `confidence` + `notes`. This turns *accuracy* into *human-review rate* — a cheaper model produces **more flagged receipts, not silent errors** — which de-risks going cheap and makes small self-hosted models viable.
+
+**Cost & self-hosting roadmap (for scale; ~1000 receipts/day = 30k/mo):**
+1. **Verify the real bill first.** Observed ~$0.10/receipt is ~8× above gemini-2.5-pro token math (~$0.013/receipt) — likely thinking-tokens + retries + high-res images. It swings the ROI; check the dashboard.
+2. **Cheapest win, zero ops — swap the API model:** Gemini 2.5 **Flash** / gpt-4o-mini / a per-token open VLM (DeepInfra ~$0.15/M, Fireworks $0.20/M) → **~$0.005–0.02/receipt**, config-only. May be enough.
+3. **Self-host when you want scale savings or data residency (GDPR — receipts are PII):**
+   - **Model:** `Qwen3-VL-8B-Instruct` (Apache-2.0, best OCR-per-VRAM) or `Qwen2.5-VL-7B` (safest); `MiniCPM-V 4.5` (tops OCRBench) as alt. Single **24 GB GPU (L4)**, FP8 ≈ 9–10 GB.
+   - **Serve** with **vLLM** (OpenAI-compatible, `guided_json` to hard-enforce the schema) → config change on our side (`VLM_URL`/`VLM_MODEL`, keyless). Keep the hosted API as a **hot fallback**.
+   - **Always-on, not serverless** (10–60 s cold starts wreck interactive UX). **One always-on L4 ≈ $365/mo ≈ $0.012/receipt**, covers **5–10k receipts/day** → $/receipt *falls* toward ~$0.002 as volume grows (API scales linearly).
+   - **Licensing landmines — AVOID:** **Llama-3.2-Vision** (license *carves out EU-based companies* — hard blocker for us), `Qwen2.5-VL-3B` and **Nanonets-OCR** (non-commercial). Use a reputable **EU-region** host with a DPA, not the cheapest marketplace GPU.
+4. **End-state — LoRA fine-tune on our own receipts.** The `needs_review` queue is a free labeling machine (`image → our JSON`). ~500–1,000 corrected labels (2–4 weeks at volume) → LoRA-tune Qwen2.5-VL-7B on one 24 GB GPU (~$50, ~1 h). A narrow-domain tune **beats frontier models on our receipts** (learns store headers, MVA/`pant`/`Rabatt`/`KORR`, comma-decimals) → **lower review rate** at ~$0.002/receipt. Re-tune monthly as formats drift. **This is the moat.**
+
+**Skip two-stage OCR→text-LLM for our receipts:** flattening the page loses row/price alignment — the main failure on crumpled thermal receipts (exactly what the prompt's ROW-ALIGNMENT rules fight). Only worth it for clean/PDF receipts or if raw OCR text is needed elsewhere.
+
+**Honest downside of self-hosting:** the GPU bill isn't the cost — devops (vLLM/CUDA upkeep), cold-start/availability, monitoring, on-call, and GDPR host choice are. At 1k/day the ~$2.6k/mo saving can be eaten by ~1 engineer's setup in year one → **at current volume, self-hosting is a bet on scaling, not an instant win.** Sequence: Flash test → always-on Qwen3-VL-8B (API fallback) → harvest labels → LoRA.
+
 ## 7. Data model
 
 > **Star schema.** One big central **fact table** (`transactions` — every line item bought) surrounded by small **dimension tables** (`users`, `chains`, `stores`, `products`, `categories`) that it points to via foreign keys. Crowd/price data is **derived from `transactions`** (aggregate queries), not a separate table at MVP (§7.3). Types are PostgreSQL; fixed-value columns use native `ENUM` types (§7.0). `PK` = primary key, `FK→x` = foreign key to table `x`. The fact table holds the FKs; dimension tables never carry a transaction id.
@@ -362,6 +396,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 3. Extraction worker (VLM + durable `SKIP LOCKED` queue on `receipts`).
 4. Price-API contract (filters, credit metering, and the B2B-access seam).
 5. Web client = React + TS SPA in `web/` (built); the Flutter `client/` was removed.
+6. **Extraction cost path (§6.1):** verify the real per-receipt bill → try Gemini Flash / per-token open VLM → self-host Qwen3-VL-8B on an EU L4 → LoRA-fine-tune on the `needs_review` label queue. Merge the `debug` branch (model picker, rescan, reconciliation, concurrency fixes) once reviewed.
 
 ## 13. Decision log
 
@@ -397,6 +432,11 @@ Not built at MVP; documented so we don't rediscover the need later:
 | 2026-07-10 | **Web frontend = React + TypeScript SPA** (Vite + Tailwind + TanStack Query + Recharts); Flutter `client/` **removed** | Team prefers TS; cleaner web DX. Supersedes the earlier Flutter-web choice (§5/§10). Native mobile revisited later |
 | 2026-07-10 | Extraction engine = **any OpenAI-compatible vision API** (`VLM_API_KEY`). **Dev = OpenRouter**, **prod = EU-direct (Mistral)** before real users | OpenRouter = 1 key to benchmark many models; but US router → not EU-resident, so switch before real user data. Config switch, no code change |
 | 2026-07-10 | Receipt→JSON **v2 schema** (nested store+address, `receipt_number`, `mva_lines`, `payment.method` no card digits, per-line `product_code`/EAN) | Richer, validatable, seeds product identity; key fields promoted to columns, rest in `raw_extraction` |
+| 2026-07-11 | Extraction accuracy pass: `KORR`/void correction handling (new `correction` item type), row-alignment + per-line `qty×unit_price` prompt rules, store address persisted, currency inferred from country code, `needs_review` reconciliation (Σ line totals vs total) with reason, model self-reported `confidence`/`notes` shown in UI | Real receipts were mis-scanned (price-column misalignment, dropped items, wrong currency, hallucinated stores); reconciliation converts accuracy → review-rate |
+| 2026-07-11 | Benchmarked models on 9 real receipts; **current default → `google/gemini-2.5-pro`** (8/9 reconciled vs ~5/9); `qwen-2.5-vl-72b` = best open-weight | Data over guesswork; gemini fixed the hard cases. OpenRouter is a US router → temporary; EU-direct or self-host before real users |
+| 2026-07-11 | `persist_extraction` made atomic under a per-receipt `FOR UPDATE` lock; rescan endpoints atomically claim (in-flight guard, 2-min stale escape) | Adversarial review found concurrent rescans duplicated line items and an unbounded (denial-of-wallet) rescan loop |
+| 2026-07-11 | **Debug tooling** (on `debug` branch): in-app model picker (`/api/debug/models`, `VLM_MODELS`), per-receipt Rescan + bulk `/api/debug/reprocess-all`, `bench_extractors`/`reprocess_all` bins, zoomable receipt viewer, confidence pill | A/B models against the reconciliation metric on live receipts; inspect/re-run without a redeploy |
+| 2026-07-11 | **Cost/self-hosting roadmap set (§6.1):** Flash-first → always-on Qwen3-VL-8B/Qwen2.5-VL-7B on one L4 (~$0.012/rcpt) → LoRA fine-tune on the review-queue labels (~$0.002/rcpt). Avoid Llama-3.2-Vision (EU license carve-out) | ~$0.10/rcpt hosted won't scale to 1000/day; the reconciliation gate makes cheap/small models viable; fine-tune on our own data is the accuracy+cost moat |
 
 ## 14. Future vision — crowdsourced item enrichment & reputation
 
