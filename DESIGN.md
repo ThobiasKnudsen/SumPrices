@@ -233,6 +233,8 @@ Note: `gtin` is the universal item id when a barcode exists; many receipt lines 
 | extraction_attempts | INT | NOT NULL, default 0 | retry counter for the queue |
 | extraction_error | TEXT | | last failure message |
 | next_attempt_at | TIMESTAMPTZ | | backoff time for retries |
+| reminder_at | TIMESTAMPTZ | | when to fire the deferred scan-reminder (~10 min post-processing, §7.11) |
+| reminder_sent_at | TIMESTAMPTZ | | NULL = not yet sent; the notifier polls `reminder_at ≤ now() AND reminder_sent_at IS NULL` |
 | created_at / updated_at | TIMESTAMPTZ | NOT NULL, default now() | |
 
 *Indexes:* `(user_id, purchase_at DESC)`; `store_id`; `extraction_status` (partial, active states) for the queue; `txn_signature`.
@@ -372,6 +374,19 @@ A paper receipt prints *local* wall-clock time with no zone, but `purchase_at` s
 
 *Unique:* `(chain_id, store_id, key_type, key_value)` — one active mapping per key/scope. *Index:* `(chain_id, key_type, key_value)` for the Tier-1 lookup.
 
+**`push_subscriptions`** — web-push endpoints for the §7.11 scan-reminder (pulls the deferred `devices` §7.8 forward; email uses `users.email`)
+
+| Column | Type | Key / Rules | Notes |
+|---|---|---|---|
+| id | UUID | PK | |
+| user_id | UUID | FK→users, NOT NULL, cascade delete | |
+| kind | TEXT | NOT NULL, default 'web' | 'web' now; 'fcm' / 'apns' when native lands |
+| endpoint | TEXT | NOT NULL | web-push endpoint URL (or device token) |
+| p256dh / auth | TEXT | | web-push encryption keys |
+| created_at | TIMESTAMPTZ | NOT NULL, default now() | |
+
+*Unique:* `(user_id, endpoint)`.
+
 **`review_queue`** *(later)* — receipts / items needing resolution. MVP uses the `needs_review` flags; a dedicated table + resolution UX comes later.
 
 ### 7.6 Anti-fraud & de-duplication
@@ -396,7 +411,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 - **Generic `jobs` table** — only if job types multiply beyond extraction (MVP: `receipts` is the queue, §7.2).
 - **`consent_events`** — full GDPR consent audit trail (MVP uses columns on `users`).
 - **`data_requests`** — track GDPR export / deletion (DSAR) requests and their status.
-- **`devices`** — push-notification tokens (when notifications ship).
+- **`devices`** — native push tokens (FCM/APNs) when native mobile lands; the web-push subset ships at MVP as `push_subscriptions` (§7.5, §7.11).
 - **`store_aliases`** — raw store-name → `store_id` resolution (the store-side analog of `product_mappings` §7.10; part of the later identity-resolution flow).
 - **`receipt_tags` / notes** — user annotations on receipts.
 - **Item-enrichment tables** (`item_contributions`, `info_requests`, `contribution_verifications`) + KYC fields — the crowdsourced-enrichment vision (§14).
@@ -467,6 +482,27 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 **MVP scope (ruling — seam + label mechanism + cheap tiers):** Tier 0 + Tier 1 + a simple `pg_trgm` Tier 2; the barcode-scan endpoint + escrowed `barcode_reward`; the `product_mappings` table; `transactions.product_code` + `resolution_confidence` + `resolution_method`.
 **Later:** embedding/semantic matcher; full multi-user weighted-consensus resolution; **GTIN → Open Food Facts / GS1 enrichment** (name/brand/image from a scanned barcode); cross-chain product unification at scale; bounties for *requested* scans (§14).
 
+### 7.11 Engagement — deferred-scan notification & gamified credit
+
+*The §7.10 barcode labels only exist if users scan — and nobody scans at the checkout. So re-engage ~10 min after purchase, when they're likely home unpacking the bag.*
+
+**The loop:**
+1. When a receipt finishes processing, schedule a reminder ~10 min out (`receipts.reminder_at`) — a **plain timer, not geofenced** (VPN-safe stance §7.4; no location/IP).
+2. A worker polls due reminders (`reminder_at ≤ now() AND reminder_sent_at IS NULL … FOR UPDATE SKIP LOCKED`, same pattern as the extraction queue) and delivers via **web push** (PWA, where supported) with an **email fallback**, deep-linking to that receipt.
+3. The receipt view lists every registered line; scannable ones (`item_type = 'product'`, `resolution_method ∈ {unresolved, fuzzy}`) show a **claimable-credit button**. Scanning the item barcode resolves it (§7.10 Tier-3) and awards **value-of-information-weighted** credit — ambiguous+frequent items visibly worth more ("15 pts").
+4. Credit lands through **escrow** (§7.9) with **celebratory feedback** (counter tick-up / micro-animation) — the gamification hook.
+
+**Delivery surface (ruling): pending-scans queue + web push + email fallback.** The in-app **pending-scans queue** is the substrate and always works — *derived*, no new table: the claimable lines and their VoI credit values are computed at read time (§7.10). **Web push** (unreliable on iOS Safari) + **email** are the notifiers layered on top; rich native notifications arrive with native mobile (later).
+
+**Credit ≠ money.** Credit = in-app points (gamified, spent on the Price API, §7.7). Keep it visually distinct from any real-NOK figure — conflation confuses users and lets a soft number contaminate credit's integrity.
+
+**Schema seams (MVP):** `receipts.reminder_at` + `reminder_sent_at` (the scheduler; a dedicated notifications table only if types multiply, cf. the jobs-table rule §7.8); `push_subscriptions` (§7.5). Claimable-credit-per-line is derived, not stored.
+
+**Deferred (§11) — the "money saved" metric.** Punted post-MVP (low priority, and unreliable early). Captured so we don't redesign it from scratch: it is **not one number**, and only a *provable* version is safe to headline — Norwegian *Markedsføringsloven* / EU rules penalize misleading savings claims, and gamification pressures inflation. Three phased definitions:
+- **① saved vs shelf** = `Σ discount_amount` (the receipt's own Rabatt/promo lines) — provable, already in schema; the eventual honest headline.
+- **② vs your own usual** = `(your median price − paid) × qty` for a resolved product — needs §7.10, no crowd; can be negative.
+- **③ vs market** = `(robust crowd median − paid) × qty` — this *is* the "overpaying" feature; needs crowd + the §7.3.1 gate; **median not mean, show a confidence range, allow negative** ("you paid 12 kr over typical").
+
 ## 8. GDPR & compliance (hard constraints)
 
 - Receipts can be **Article 9 special-category** data (pharmacy → health, etc.) → treat the corpus as sensitive; use **explicit consent** as the lawful basis.
@@ -492,10 +528,10 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 ## 11. Roadmap (phased)
 
 **Launch (MVP)**
-- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; **product resolution** (Tier-0/1 deterministic + `pg_trgm` Tier-2 guess + barcode-scan-for-credit, §7.10); personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan **+ barcode scan**); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
+- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; **product resolution** (Tier-0/1 deterministic + `pg_trgm` Tier-2 guess + barcode-scan-for-credit, §7.10); **deferred-scan reminder** (pending-scans queue + web push + email, §7.11) with gamified credit feedback; personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan **+ barcode scan**); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
 
 **Later**
-- Email/mailbox digital-receipt ingestion; **advanced product resolution** (embedding/semantic matcher, multi-user weighted-consensus, GTIN→Open Food Facts/GS1 enrichment, §7.10); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
+- Email/mailbox digital-receipt ingestion; **advanced product resolution** (embedding/semantic matcher, multi-user weighted-consensus, GTIN→Open Food Facts/GS1 enrichment, §7.10); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; **"money saved" metric** (§7.11 — provable→personal→market, phased); rich **native-mobile notifications** (FCM/APNs); international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
 
 ## 12. Open items / next steps
 
@@ -546,6 +582,7 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 | 2026-07-11 | **Debug tooling** (on `debug` branch): in-app model picker (`/api/debug/models`, `VLM_MODELS`), per-receipt Rescan + bulk `/api/debug/reprocess-all`, `bench_extractors`/`reprocess_all` bins, zoomable receipt viewer, confidence pill | A/B models against the reconciliation metric on live receipts; inspect/re-run without a redeploy |
 | 2026-07-11 | **Cost/self-hosting roadmap set (§6.1):** Flash-first → always-on Qwen3-VL-8B/Qwen2.5-VL-7B on one L4 (~$0.012/rcpt) → LoRA fine-tune on the review-queue labels (~$0.002/rcpt). Avoid Llama-3.2-Vision (EU license carve-out) | ~$0.10/rcpt hosted won't scale to 1000/day; the reconciliation gate makes cheap/small models viable; fine-tune on our own data is the accuracy+cost moat |
 | 2026-07-11 | **Receipt trust model (§7.9):** trust = **three independent statistical signals, not one score** — Fidelity (calibrated reconciliation), Authenticity (corroboration likelihood-ratio + robust-Mahalanobis novelty + dedup-as-LR), Reliability (hierarchical Bayesian truth-discovery + robust weighted aggregation); combined in **log-odds**, consumed by **two gates** (credit vs Price-API index-inclusion); enforced only where value crosses a membrane, never on the personal archive. Seams pulled to MVP: irreversible **capture-provenance** logging (`captured_at`/`capture_meta`), **escrow credit** (`ledger_settle_state`), `receipts.authenticity_score` | User: all three needed but **kept separate**, and **at least authenticity + reliability must be statistical**. The arithmetic gate proves transcription fidelity, not authenticity; the crowd price index doubles as the fraud detector (corroboration), so it self-activates as data accrues. Both MVP seams approved (capture provenance is un-backfillable; escrow is cheap now / painful later) |
+| 2026-07-11 | **Engagement loop (§7.11):** collect §7.10 barcode labels via a **deferred scan-reminder** ~10 min post-purchase (plain timer, not geofenced) → deep-link to the receipt → per-line claimable-credit buttons (VoI-weighted) → gamified credit feedback via §7.9 escrow. Delivery = **in-app pending-scans queue** (substrate, derived) **+ web push + email fallback**; rich native notifications later. Seams: `receipts.reminder_at`/`reminder_sent_at`, `push_subscriptions` (pulls deferred `devices` forward). **Money-saved metric DEFERRED** post-MVP (low value early, misleading-claim risk) but its 3 phased definitions (vs shelf / vs own usual / vs market) captured | User: notify when likely home (not at checkout); gamify credit; money-saved deferred — "not that important and not that reliable." Web-only push is weak on iOS, so the queue is the always-works substrate |
 | 2026-07-11 | **Product resolution (§7.10) is MVP:** receipt line → GTIN — the crowd index *depends* on it (raw strings fragment the asset; §7.3 previously assumed resolution existed but deferred it — inconsistency fixed). Cascade: Tier-0 EAN self-resolve → Tier-1 deterministic `(chain, product_code)` PLU map → Tier-2 `pg_trgm` probabilistic guess → Tier-3 **barcode-scan-for-credit** gold label (value-of-information reward, escrowed, corroborated). **Probabilistic guesses power *personal* freely but feed the *crowd* only on deterministic/corroborated resolution** (same two-gate rule as §7.9). New schema: `product_mappings` table (generalizes the old `raw_text_mappings`), `transactions.product_code`/`resolution_method`/`resolution_confidence`, `barcode_reward` reason | User flagged the gap; barcode scans are the ground-truth label flywheel (calibrate Tier-2, à la §6.1/§7.9); a scan is a claim → reuse §7.9 consensus + escrow anti-fraud |
 | 2026-07-11 | **Price API privacy model (§7.3.1):** aggregate-query-only (no per-receipt endpoint); per-item independent cells with a **no-co-occurrence** rule; availability by a re-id **risk formula** (`ρ=1/n`, Poisson population-uniqueness) not a fixed K; **differential privacy** (ε budget) on price *and* volume; resolution is a shared budget traded across area/time/price; enforced at the query layer + a locked-down DB role over the same `transactions` (no schema change; receipts stay full-detail per user) | User's design; makes the price domain provably *anonymous* not just pseudonymous, keeps it commercially useful, and needs no data duplication at MVP |
 
